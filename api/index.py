@@ -13,7 +13,6 @@ SCOPES = [
 ]
 
 def get_spreadsheet():
-    """Helper to connect to the master Google Spreadsheet file object."""
     creds_raw = os.environ.get("GOOGLE_CREDENTIALS")
     if not creds_raw:
         raise RuntimeError("GOOGLE_CREDENTIALS environment variable is missing!")
@@ -23,7 +22,7 @@ def get_spreadsheet():
     client = gspread.authorize(creds)
     return client.open("Aeris Beaute - Stock Opname Master Template")
 
-# --- UPGRADED HTML WITH TEXT-FILTERABLE SKU DROPDOWN ---
+# --- ADVANCED CASCADE DROPDOWN MOBILE UI ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -37,7 +36,6 @@ HTML_TEMPLATE = """
 <body class="bg-gray-50 p-4 font-sans text-gray-800 antialiased">
     <div class="max-w-md mx-auto space-y-6">
         
-        <!-- MAIN INPUT FORM PANEL -->
         <div class="bg-white rounded-2xl shadow-xl p-6 space-y-5 border border-gray-100">
             <div class="text-center space-y-1">
                 <h2 class="text-2xl font-extrabold text-indigo-600 tracking-tight">Aeris Beaute</h2>
@@ -46,7 +44,7 @@ HTML_TEMPLATE = """
             
             <hr class="border-gray-100">
 
-            <!-- Team Input -->
+            <!-- Counter Team -->
             <div>
                 <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">Counter Team</label>
                 <select id="counterTeam" onchange="fetchHistory()" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none font-medium bg-white transition">
@@ -57,7 +55,7 @@ HTML_TEMPLATE = """
                 </select>
             </div>
 
-            <!-- Viewfinder Panel -->
+            <!-- Scanner Panel -->
             <div class="border-2 border-dashed border-indigo-200 p-2 rounded-2xl bg-indigo-50/30 overflow-hidden">
                 <div id="reader" class="w-full rounded-xl overflow-hidden bg-black"></div>
                 <div class="flex justify-around space-x-3 mt-2">
@@ -70,24 +68,37 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Location Output -->
+            <!-- Precise Location -->
             <div>
                 <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">Precise Location</label>
                 <input type="text" id="location" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 bg-gray-100 font-mono font-bold text-indigo-700" readonly placeholder="Scan Location QR Code First">
             </div>
 
-            <!-- SKU Dropdown Selector Selection -->
+            <!-- CASCADE LAYER 1: SKU TYPE -->
             <div>
-                <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">SKU Code Selection</label>
-                <select id="skuSelector" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none font-semibold bg-white transition">
-                    <option value="">-- Tap to Select SKU --</option>
-                    {% for sku in skus %}
-                    <option value="{{ sku }}">{{ sku }}</option>
-                    {% endfor %}
+                <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">1. Goods Type</label>
+                <select id="skuType" onchange="updateCategories()" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none font-semibold bg-white transition">
+                    <option value="">-- Choose Finished / Unfinished --</option>
                 </select>
             </div>
 
-            <!-- Metric Counter Control Box -->
+            <!-- CASCADE LAYER 2: SKU CATEGORY -->
+            <div>
+                <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">2. Product Category</label>
+                <select id="skuCategory" onchange="updateSkus()" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none font-semibold bg-white transition" disabled>
+                    <option value="">-- Choose Category --</option>
+                </select>
+            </div>
+
+            <!-- CASCADE LAYER 3: ACTUAL SKU -->
+            <div>
+                <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">3. Target SKU Code</label>
+                <select id="skuSelector" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none font-semibold bg-white transition" disabled>
+                    <option value="">-- Choose SKU --</option>
+                </select>
+            </div>
+
+            <!-- Counter Box -->
             <div>
                 <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">Physical Count</label>
                 <div class="flex items-center space-x-2 mt-1">
@@ -99,19 +110,18 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- User Notes -->
+            <!-- Notes -->
             <div>
                 <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">Notes</label>
                 <input type="text" id="notes" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none text-sm transition" placeholder="e.g., damaged box">
             </div>
 
-            <!-- Submitting Trigger Button -->
             <button id="submitBtn" onclick="submitData()" class="w-full bg-emerald-500 hover:bg-emerald-600 active:scale-[0.98] text-white font-extrabold text-lg p-4 rounded-xl shadow-md hover:shadow-lg transition transform duration-150">
                 📤 SUBMIT TO MASTER SHEET
             </button>
         </div>
 
-        <!-- LIVE TEAM HISTORY SECTION -->
+        <!-- RECENT ACTIVITY FEED -->
         <div class="bg-white rounded-2xl shadow-lg p-6 border border-gray-100 space-y-4">
             <div class="flex justify-between items-center">
                 <h3 class="text-md font-bold text-gray-700 uppercase tracking-wide">📋 Your Recent Activity</h3>
@@ -124,10 +134,61 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
+        // Inject the structured dictionary safely from Python Flask runtime
+        const skuTree = {{ sku_tree|tojson|safe }};
         let currentTarget = '';
         const html5QrcodeScanner = new Html5Qrcode("reader");
 
-        window.onload = () => { fetchHistory(); };
+        window.onload = () => { 
+            initializeTree();
+            fetchHistory(); 
+        };
+
+        function initializeTree() {
+            const typeSelect = document.getElementById('skuType');
+            typeSelect.innerHTML = '<option value="">-- Choose Finished / Unfinished --</option>';
+            Object.keys(skuTree).sort().forEach(type => {
+                typeSelect.options[typeSelect.options.length] = new Option(type, type);
+            });
+        }
+
+        function updateCategories() {
+            const typeVal = document.getElementById('skuType').value;
+            const catSelect = document.getElementById('skuCategory');
+            const skuSelect = document.getElementById('skuSelector');
+            
+            catSelect.innerHTML = '<option value="">-- Choose Category --</option>';
+            skuSelect.innerHTML = '<option value="">-- Choose SKU --</option>';
+            skuSelect.disabled = true;
+
+            if (!typeVal || !skuTree[typeVal]) {
+                catSelect.disabled = true;
+                return;
+            }
+
+            catSelect.disabled = false;
+            Object.keys(skuTree[typeVal]).sort().forEach(cat => {
+                catSelect.options[catSelect.options.length] = new Option(cat, cat);
+            });
+        }
+
+        function updateSkus() {
+            const typeVal = document.getElementById('skuType').value;
+            const catVal = document.getElementById('skuCategory').value;
+            const skuSelect = document.getElementById('skuSelector');
+            
+            skuSelect.innerHTML = '<option value="">-- Choose SKU --</option>';
+
+            if (!catVal || !skuTree[typeVal] || !skuTree[typeVal][catVal]) {
+                skuSelect.disabled = true;
+                return;
+            }
+
+            skuSelect.disabled = false;
+            skuTree[typeVal][catVal].sort().forEach(sku => {
+                skuSelect.options[skuSelect.options.length] = new Option(sku, sku);
+            });
+        }
 
         function startScan(target) {
             currentTarget = target;
@@ -139,18 +200,24 @@ HTML_TEMPLATE = """
                     if (currentTarget === 'location') {
                         document.getElementById('location').value = text;
                     } else if (currentTarget === 'sku') {
-                        const selectEl = document.getElementById('skuSelector');
-                        // Find match inside dropdown options context
+                        // Advanced Barcode Resolve Loop: Deep search the tree to resolve the layout state
                         let found = false;
-                        for (let i = 0; i < selectEl.options.length; i++) {
-                            if (selectEl.options[i].value === text) {
-                                selectEl.selectedIndex = i;
-                                found = true;
-                                break;
+                        for (const type in skuTree) {
+                            for (const cat in skuTree[type]) {
+                                if (skuTree[type][cat].includes(text)) {
+                                    document.getElementById('skuType').value = type;
+                                    updateCategories();
+                                    document.getElementById('skuCategory').value = cat;
+                                    updateSkus();
+                                    document.getElementById('skuSelector').value = text;
+                                    found = true;
+                                    break;
+                                }
                             }
+                            if (found) break;
                         }
                         if (!found) {
-                            alert('⚠️ Barcode Scanned: ' + text + '\\nBut this item code does not match your SKU master list tab definitions.');
+                            alert('⚠️ Barcode Matrix Match Failure: ' + text + '\\nThis product code does not exist in your SKU List dictionary tab.');
                         }
                     }
                     html5QrcodeScanner.stop();
@@ -209,7 +276,7 @@ HTML_TEMPLATE = """
             const btn = document.getElementById('submitBtn');
 
             if (!locInput || !skuInput || countInput === '') {
-                alert('Please fill out Location, SKU selection, and Count parameters.');
+                alert('Please fill out Location, SKU selection levels, and Count parameters.');
                 return;
             }
 
@@ -234,12 +301,13 @@ HTML_TEMPLATE = """
 
                 if (response.ok) {
                     alert('✅ Data logged safely!');
-                    document.getElementById('skuSelector').selectedIndex = 0;
+                    document.getElementById('skuType').selectedIndex = 0;
+                    updateCategories();
                     document.getElementById('count').value = '0';
                     document.getElementById('notes').value = '';
                     fetchHistory();
                 } else {
-                    alert('❌ Connection Error: Verification failed.');
+                    alert('❌ Connection Error: Sync failed.');
                 }
             } catch (err) {
                 alert('❌ Transmission Failed.');
@@ -297,22 +365,56 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def home():
-    """Dynamically reads your master SKU inventory list from the specific dictionary tab."""
+    """Reads SKU table columns and builds a dynamic nested dictionary tree engine on startup."""
+    sku_tree = {}
     try:
         wb = get_spreadsheet()
-        # Points directly to your master SKU list storage worksheet
         sku_worksheet = wb.worksheet("SKU List")
         
-        # Pulls values strictly from Column A (skipping header cell A1)
-        raw_skus = sku_worksheet.col_values(1)[1:] 
+        # Pull down all row values across columns A, B, and C in one batch request
+        list_of_lists = sku_worksheet.get_all_values()
         
-        # Clean out empty spaces if your list contains empty trailing row blocks
-        sku_list = [str(s).strip() for s in raw_skus if s]
+        if len(list_of_lists) > 1:
+            headers = list_of_lists[0]
+            # Verify positions dynamically based on our expected headers[cite: 1]
+            sku_idx = headers.index("SKU Code") if "SKU Code" in headers else 0
+            type_idx = headers.index("SKU Type") if "SKU Type" in headers else 1
+            cat_idx = headers.index("SKU Category") if "SKU Category" in headers else 2
+            
+            # Map data rows cleanly
+            for row in list_of_lists[1:]:
+                if len(row) <= max(sku_idx, type_idx, cat_idx):
+                    continue
+                
+                sku_code = str(row[sku_idx]).strip()
+                goods_type = str(row[type_idx]).strip() or "General Goods"
+                category = str(row[cat_idx]).strip() or "Unassigned"
+                
+                if not sku_code:
+                    continue
+                
+                # Build tree layers: Type -> Category -> [SKU Codes]
+                if goods_type not in sku_tree:
+                    sku_tree[goods_type] = {}
+                if category not in sku_tree[goods_type]:
+                    sku_tree[goods_type][category] = []
+                    
+                if sku_code not in sku_tree[goods_type][category]:
+                    sku_tree[goods_type][category].append(sku_code)
+                    
     except Exception:
-        # Fallback dictionary to keep the site landing safe if network drops
-        sku_list = ["AR-EYL-01", "AR-BLS-03"] 
+        # Emergency robust local fallback data matrix if Google Cloud hits API limits
+        sku_tree = {
+            "Finished": {
+                "Brushes": ["AR-BRSH-01", "AR-BRSH-02"],
+                "Puffs": ["AR-PUFF-01", "AR-PUFF-02"]
+            },
+            "Unfinished": {
+                "Raw Materials": ["RAW-YARN-01", "RAW-BOX-02"]
+            }
+        }
         
-    return render_template_string(HTML_TEMPLATE, skus=sku_list)
+    return render_template_string(HTML_TEMPLATE, sku_tree=sku_tree)
 
 @app.route('/history', methods=['GET'])
 def history():
@@ -345,7 +447,7 @@ def submit():
         
         row_to_append = [
             log_id,              # Column A: Log ID
-            data['team'],        # Column B: Counter Team
+            data['team'],        # Column B: Counter Team[cite: 1]
             zone_prefix,         # Column C: Zone[cite: 1]
             data['location'],    # Column D: Precise Location[cite: 1]
             data['sku'],         # Column E: SKU Code[cite: 1]
