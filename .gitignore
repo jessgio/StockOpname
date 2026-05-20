@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 *credentials.json
 api/credentials.json
+.vercel
+.env*.local
