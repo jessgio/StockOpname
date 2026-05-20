@@ -2,21 +2,28 @@ import os
 import json
 from flask import Flask, render_template_string, request, jsonify
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 import uuid
 
 app = Flask(__name__)
 
-# 1. Access Google Credentials safely from Vercel's environment variables
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+# 1. Access Google Credentials using modern Google Auth libraries
+scope = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
 creds_raw = os.environ.get("GOOGLE_CREDENTIALS")
 
 if creds_raw:
-    creds_dict = json.loads(creds_raw)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
-    # Connects to your exact master spreadsheet template
-    sheet = client.open("Aeris Beaute - Stock Opname Master Template").worksheet("Raw Counts")
+    try:
+        creds_dict = json.loads(creds_raw)
+        # Use the modern, serverless-friendly credentials loader
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+        client = gspread.authorize(creds)
+        sheet = client.open("Aeris Beaute - Stock Opname Master Template").worksheet("Raw Counts")
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize Google Sheet: {str(e)}")
 else:
     raise RuntimeError("GOOGLE_CREDENTIALS environment variable is missing!")
 
@@ -28,9 +35,7 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Aeris Opname 2026</title>
-    <!-- Tailwind CSS for modern look and feel -->
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-    <!-- Open-source high-speed QR/Barcode scanning framework -->
     <script src="https://unpkg.com/html5-qrcode"></script>
 </head>
 <body class="bg-gray-50 p-4 font-sans text-gray-800 antialiased">
@@ -43,7 +48,6 @@ HTML_TEMPLATE = """
         
         <hr class="border-gray-100">
 
-        <!-- Step 1: Team Selection -->
         <div>
             <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">Counter Team</label>
             <select id="counterTeam" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none font-medium bg-white transition">
@@ -54,7 +58,6 @@ HTML_TEMPLATE = """
             </select>
         </div>
 
-        <!-- Camera Scanner Viewfinder -->
         <div class="border-2 border-dashed border-indigo-200 p-2 rounded-2xl bg-indigo-50/30 overflow-hidden">
             <div id="reader" class="w-full rounded-xl overflow-hidden bg-black"></div>
             <div class="flex justify-around space-x-3 mt-2">
@@ -67,19 +70,16 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Step 2: Location Data -->
         <div>
             <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">Precise Location</label>
             <input type="text" id="location" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 bg-gray-100 font-mono font-bold text-indigo-700" readonly placeholder="Scan Location QR Code First">
         </div>
 
-        <!-- Step 3: SKU Entry -->
         <div>
             <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">SKU Code</label>
             <input type="text" id="sku" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none font-semibold transition" placeholder="Scan item or type manually">
         </div>
 
-        <!-- Step 4: Physical Count Input -->
         <div>
             <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">Physical Count</label>
             <div class="flex items-center space-x-2 mt-1">
@@ -91,13 +91,11 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Step 5: Optional Notes -->
         <div>
             <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">Notes</label>
-            <input type="text" id="notes" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none text-sm transition" placeholder="e.g., damaged box, promo sticker bundle">
+            <input type="text" id="notes" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none text-sm transition" placeholder="e.g., damaged box">
         </div>
 
-        <!-- Submit Button -->
         <button onclick="submitData()" class="w-full bg-emerald-500 hover:bg-emerald-600 active:scale-[0.98] text-white font-extrabold text-lg p-4 rounded-xl shadow-md hover:shadow-lg transition transform duration-150">
             📤 SUBMIT TO MASTER SHEET
         </button>
@@ -109,7 +107,6 @@ HTML_TEMPLATE = """
 
         function startScan(target) {
             currentTarget = target;
-            // Configured to favor the high-resolution back camera on modern mobile phones
             html5QrcodeScanner.start(
                 { facingMode: "environment" },
                 { fps: 15, qrbox: { width: 250, height: 250 } },
@@ -117,7 +114,7 @@ HTML_TEMPLATE = """
                     document.getElementById(currentTarget).value = decodedText;
                     html5QrcodeScanner.stop();
                 },
-                (errorMessage) => { /* Silently suppress continuous scanner logging noise */ }
+                (errorMessage) => {}
             );
         }
 
@@ -135,7 +132,7 @@ HTML_TEMPLATE = """
             const countInput = document.getElementById('count').value;
 
             if (!locInput || !skuInput || countInput === '') {
-                alert('🚨 Operational Error: Please fill out Location, SKU, and Count before submitting.');
+                alert('Please fill out Location, SKU, and Count before submitting.');
                 return;
             }
 
@@ -155,17 +152,15 @@ HTML_TEMPLATE = """
                 });
 
                 if (response.ok) {
-                    alert('✅ Data logged safely to the Control Desk!');
-                    // Clear product metrics so they don't double count, but KEEP team and location active 
-                    // so they can rapidly scan multiple distinct SKUs sitting on the exact same shelf.
+                    alert('✅ Data logged safely!');
                     document.getElementById('sku').value = '';
                     document.getElementById('count').value = '0';
                     document.getElementById('notes').value = '';
                 } else {
-                    alert('❌ Connection Error: Data could not be saved. Contact Control Desk immediately.');
+                    alert('❌ Connection Error: Contact Control Desk.');
                 }
             } catch (err) {
-                alert('❌ Transmission Failed: Check cellular connection.');
+                alert('❌ Transmission Failed.');
             }
         }
     </script>
@@ -182,24 +177,18 @@ def submit():
     data = request.json
     log_id = str(uuid.uuid4())[:8] 
     
-    # Automatically extracts the top-level Zone letter (e.g., extracts "A" out of "A-01-A")[cite: 1]
     zone_prefix = data['location'].split('-')[0] if '-' in data['location'] else data['location'][:1]
     
-    # Maps exactly to your 8 actual spreadsheet headers[cite: 1]
     row_to_append = [
-        log_id,              # Column A: Log ID[cite: 1]
+        log_id,              # Column A: Log ID
         data['team'],        # Column B: Counter Team[cite: 1]
         zone_prefix,         # Column C: Zone[cite: 1]
         data['location'],    # Column D: Precise Location[cite: 1]
         data['sku'],         # Column E: SKU Code[cite: 1]
-        "",                  # Column F: Item Name (Left blank for your sheet's automatic XLOOKUP/VLOOKUP formula)[cite: 1]
+        "",                  # Column F: Item Name[cite: 1]
         int(data['count']),  # Column G: Physical Count[cite: 1]
         data['notes']        # Column H: Notes[cite: 1]
     ]
     
     sheet.append_row(row_to_append)
     return jsonify({"status": "success"}), 200
-
-# Entry point wrapper required by Vercel for serverless Python executions
-def handler(request, client):
-    return app(request, client)
