@@ -66,7 +66,7 @@ HTML_TEMPLATE = """
                         📷 Scan Location QR
                     </button>
                     <button onclick="startScan('sku')" id="scanSkuBtn" class="bg-gray-400 text-white font-bold py-2.5 px-4 rounded-xl text-sm transition shadow-sm w-1/2" disabled>
-                        🏷️ Scan SKU Barcode
+                        🏷️ Scan SKU QR Code
                     </button>
                 </div>
             </div>
@@ -107,7 +107,7 @@ HTML_TEMPLATE = """
                 <div class="flex items-center space-x-2 mt-1">
                     <button type="button" onclick="adjustCount(-10)" class="bg-gray-200 hover:bg-gray-300 font-extrabold text-xl px-4 py-2 rounded-xl transition">-10</button>
                     <button type="button" onclick="adjustCount(-1)" class="bg-gray-200 hover:bg-gray-300 font-extrabold text-xl px-4 py-2 rounded-xl transition">-1</button>
-                    <input type="number" id="count" class="w-full border-2 border-gray-200 p-3 rounded-xl focus:border-indigo-500 focus:outline-none text-center text-2xl font-black text-gray-900" value="0" min="0">
+                    <input type="number" id="count" onfocus="this.select()" onclick="this.select()" class="w-full border-2 border-gray-200 p-3 rounded-xl focus:border-indigo-500 focus:outline-none text-center text-2xl font-black text-gray-900" value="0" min="0">
                     <button type="button" onclick="adjustCount(1)" class="bg-gray-200 hover:bg-gray-300 font-extrabold text-xl px-4 py-2 rounded-xl transition">+1</button>
                     <button type="button" onclick="adjustCount(10)" class="bg-gray-200 hover:bg-gray-300 font-extrabold text-xl px-4 py-2 rounded-xl transition">+10</button>
                 </div>
