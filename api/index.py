@@ -7,27 +7,26 @@ import uuid
 
 app = Flask(__name__)
 
-# 1. Access Google Credentials using modern Google Auth libraries
-scope = [
+# Define scopes globally
+SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 
-creds_raw = os.environ.get("GOOGLE_CREDENTIALS")
+def get_sheet_client():
+    """Establishes connection to the spreadsheet on-demand instead of blocking global app startup."""
+    creds_raw = os.environ.get("GOOGLE_CREDENTIALS")
+    if not creds_raw:
+        raise RuntimeError("GOOGLE_CREDENTIALS environment variable is missing!")
+    
+    creds_dict = json.loads(creds_raw)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    client = gspread.authorize(creds)
+    
+    # Connect directly to your master file setup
+    return client.open("Aeris Beaute - Stock Opname Master Template").worksheet("Raw Counts")
 
-if creds_raw:
-    try:
-        creds_dict = json.loads(creds_raw)
-        # Use the modern, serverless-friendly credentials loader
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-        client = gspread.authorize(creds)
-        sheet = client.open("Aeris Beaute - Stock Opname Master Template").worksheet("Raw Counts")
-    except Exception as e:
-        raise RuntimeError(f"Failed to initialize Google Sheet: {str(e)}")
-else:
-    raise RuntimeError("GOOGLE_CREDENTIALS environment variable is missing!")
-
-# 2. Embedded HTML Mobile UI with Tailwind CSS and Html5-Qrcode
+# --- EMBEDDED HTML INTERFACE ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -48,6 +47,7 @@ HTML_TEMPLATE = """
         
         <hr class="border-gray-100">
 
+        <!-- Team Input -->
         <div>
             <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">Counter Team</label>
             <select id="counterTeam" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none font-medium bg-white transition">
@@ -58,6 +58,7 @@ HTML_TEMPLATE = """
             </select>
         </div>
 
+        <!-- Viewfinder Panel -->
         <div class="border-2 border-dashed border-indigo-200 p-2 rounded-2xl bg-indigo-50/30 overflow-hidden">
             <div id="reader" class="w-full rounded-xl overflow-hidden bg-black"></div>
             <div class="flex justify-around space-x-3 mt-2">
@@ -70,16 +71,19 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- Location Output -->
         <div>
             <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">Precise Location</label>
             <input type="text" id="location" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 bg-gray-100 font-mono font-bold text-indigo-700" readonly placeholder="Scan Location QR Code First">
         </div>
 
+        <!-- SKU Code -->
         <div>
             <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">SKU Code</label>
             <input type="text" id="sku" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none font-semibold transition" placeholder="Scan item or type manually">
         </div>
 
+        <!-- Metric Counter Control Box -->
         <div>
             <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">Physical Count</label>
             <div class="flex items-center space-x-2 mt-1">
@@ -91,12 +95,14 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- User Notes -->
         <div>
             <label class="block text-xs font-bold text-gray-500 uppercase tracking-wide">Notes</label>
-            <input type="text" id="notes" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none text-sm transition" placeholder="e.g., damaged box">
+            <input type="text" id="notes" class="w-full border-2 border-gray-200 p-3 rounded-xl mt-1 focus:border-indigo-500 focus:outline-none text-sm transition" placeholder="e.g., damaged box, promo pack">
         </div>
 
-        <button onclick="submitData()" class="w-full bg-emerald-500 hover:bg-emerald-600 active:scale-[0.98] text-white font-extrabold text-lg p-4 rounded-xl shadow-md hover:shadow-lg transition transform duration-150">
+        <!-- Submitting Trigger Button -->
+        <button id="submitBtn" onclick="submitData()" class="w-full bg-emerald-500 hover:bg-emerald-600 active:scale-[0.98] text-white font-extrabold text-lg p-4 rounded-xl shadow-md hover:shadow-lg transition transform duration-150">
             📤 SUBMIT TO MASTER SHEET
         </button>
     </div>
@@ -130,11 +136,17 @@ HTML_TEMPLATE = """
             const locInput = document.getElementById('location').value;
             const skuInput = document.getElementById('sku').value.trim();
             const countInput = document.getElementById('count').value;
+            const btn = document.getElementById('submitBtn');
 
             if (!locInput || !skuInput || countInput === '') {
                 alert('Please fill out Location, SKU, and Count before submitting.');
                 return;
             }
+
+            // Simple UI lock to prevent aggressive accidental multi-clicks
+            btn.disabled = true;
+            btn.innerText = "TRANSMITTING DATA...";
+            btn.classList.replace('bg-emerald-500', 'bg-gray-400');
 
             const payload = {
                 team: document.getElementById('counterTeam').value,
@@ -152,15 +164,19 @@ HTML_TEMPLATE = """
                 });
 
                 if (response.ok) {
-                    alert('✅ Data logged safely!');
+                    alert('✅ Data logged safely to the Control Desk!');
                     document.getElementById('sku').value = '';
                     document.getElementById('count').value = '0';
                     document.getElementById('notes').value = '';
                 } else {
-                    alert('❌ Connection Error: Contact Control Desk.');
+                    alert('❌ Connection Error: Verification failed at Control Desk.');
                 }
             } catch (err) {
-                alert('❌ Transmission Failed.');
+                alert('❌ Transmission Failed: Check network connectivity.');
+            } finally {
+                btn.disabled = false;
+                btn.innerText = "SUBMIT TO MASTER SHEET";
+                btn.classList.replace('bg-gray-400', 'bg-emerald-500');
             }
         }
     </script>
@@ -168,27 +184,38 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# --- ROUTES ---
+
 @app.route('/')
 def home():
+    """Serves the frontend layout instantly with zero network lookup latency."""
     return render_template_string(HTML_TEMPLATE)
 
 @app.route('/submit', methods=['POST'])
 def submit():
-    data = request.json
-    log_id = str(uuid.uuid4())[:8] 
-    
-    zone_prefix = data['location'].split('-')[0] if '-' in data['location'] else data['location'][:1]
-    
-    row_to_append = [
-        log_id,              # Column A: Log ID
-        data['team'],        # Column B: Counter Team[cite: 1]
-        zone_prefix,         # Column C: Zone[cite: 1]
-        data['location'],    # Column D: Precise Location[cite: 1]
-        data['sku'],         # Column E: SKU Code[cite: 1]
-        "",                  # Column F: Item Name[cite: 1]
-        int(data['count']),  # Column G: Physical Count[cite: 1]
-        data['notes']        # Column H: Notes[cite: 1]
-    ]
-    
-    sheet.append_row(row_to_append)
-    return jsonify({"status": "success"}), 200
+    """Handles the heavy data synchronization step entirely within an active lifecycle request."""
+    try:
+        data = request.json
+        log_id = str(uuid.uuid4())[:8] 
+        
+        # Pull out Zone prefix cleanly (e.g. "A" from "A-01-A")[cite: 1]
+        zone_prefix = data['location'].split('-')[0] if '-' in data['location'] else data['location'][:1]
+        
+        row_to_append = [
+            log_id,              # Column A: Log ID
+            data['team'],        # Column B: Counter Team[cite: 1]
+            zone_prefix,         # Column C: Zone[cite: 1]
+            data['location'],    # Column D: Precise Location[cite: 1]
+            data['sku'],         # Column E: SKU Code[cite: 1]
+            "",                  # Column F: Item Name (Handled by Sheet Formula)[cite: 1]
+            int(data['count']),  # Column G: Physical Count[cite: 1]
+            data['notes']        # Column H: Notes[cite: 1]
+        ]
+        
+        # Connect dynamically and push data instantly
+        sheet = get_sheet_client()
+        sheet.append_row(row_to_append)
+        
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
