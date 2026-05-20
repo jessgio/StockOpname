@@ -219,3 +219,14 @@ def submit():
         return jsonify({"status": "success"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+    
+# [ADD THIS AT THE VERY BOTTOM OF YOUR api/index.py FILE]
+
+@app.route('/favicon.ico')
+@app.route('/favicon.png')
+def favicon():
+    """Safely intercepts automated browser icon requests to prevent 500 routing crashes."""
+    return '', 204
+
+# Essential fallback binding for Vercel's WSGI routing engine
+app = app
