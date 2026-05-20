@@ -346,7 +346,7 @@ HTML_TEMPLATE = """
 
                 if (response.status === 409) {
                     // Triggered by Duplicate Warning interceptor
-                    alert(`⚠️ DUPLICATE ENTRY BLOCKER:\\n\\n${result.message}`);
+                    alert(`⚠️ DUPLICATE ENTRY BLOCKER:\n\n${result.message}`);
                 } else if (response.ok) {
                     alert('✅ Data logged safely!');
                     document.getElementById('count').value = '0';
