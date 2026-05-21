@@ -294,7 +294,7 @@ HTML_TEMPLATE = """
         #scanModal { display: none !important; visibility: hidden !important; pointer-events: none !important; }
         #scanModal.is-open { display: block !important; visibility: visible !important; pointer-events: auto !important; }
         #toast { pointer-events: none !important; }
-        #step1Card { position: relative; z-index: 50; pointer-events: auto !important; }
+        #step1Card { position: relative; z-index: 1; pointer-events: auto !important; }
         #step1Card input, #step1Card button { pointer-events: auto !important; touch-action: manipulation; }
         .opname-field {
             font-family: inherit;
@@ -317,14 +317,39 @@ HTML_TEMPLATE = """
         .step-locked { opacity: 0.65; }
         .step-locked button, .step-locked select { pointer-events: none; }
         .step-locked input:not([readonly]) { pointer-events: none; }
-        .location-sticky-bar {
+        #opnameTopChrome {
             position: sticky;
             top: 0;
-            z-index: 20;
-            background: rgb(236 253 245 / 0.97);
+            z-index: 50;
+            background: #fff;
+        }
+        body.opname-location-locked #opnameTopChrome {
+            position: fixed;
+            left: 0;
+            right: 0;
+            top: 0;
+            z-index: 50;
+            box-shadow: 0 2px 12px rgb(0 0 0 / 0.1);
+        }
+        body.opname-location-locked main {
+            padding-top: var(--opname-chrome-h, 7.25rem);
+        }
+        .location-sticky-bar {
+            background: rgb(236 253 245 / 0.98);
             backdrop-filter: blur(8px);
             border-bottom: 2px solid #34d399;
-            box-shadow: 0 2px 8px rgb(16 185 129 / 0.12);
+            box-shadow: 0 2px 8px rgb(16 185 129 / 0.15);
+        }
+        .location-sticky-bar.hidden { display: none !important; }
+        .opname-history-sticky { top: 1rem; }
+        body.opname-location-locked .opname-history-sticky {
+            top: calc(var(--opname-chrome-h, 7.25rem) + 0.5rem);
+        }
+        body.opname-location-locked .opname-history-sticky {
+            max-height: calc(100vh - var(--opname-chrome-h, 7.25rem) - 2rem);
+        }
+        body.opname-location-locked #historyContainer {
+            max-height: calc(100vh - var(--opname-chrome-h, 7.25rem) - 6rem);
         }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
@@ -356,27 +381,28 @@ HTML_TEMPLATE = """
         <div id="toastInner" class="rounded-xl px-4 py-3 text-sm font-medium shadow-lg border"></div>
     </div>
 
-    <!-- Header: brand only (inputs live in main — avoids sticky-header tap/focus bugs on mobile) -->
-    <header class="relative z-10 bg-white border-b border-zinc-200 shadow-sm">
-        <div class="max-w-md lg:max-w-5xl mx-auto px-4 py-3">
-            <div class="flex items-center justify-between gap-3">
-                <div>
-                    <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Aeris Beaute</h1>
-                    <p class="text-xs text-zinc-500">Stock Opname 2026</p>
+    <!-- Sticky top: brand header + locked location (stays above scrolling form) -->
+    <div id="opnameTopChrome">
+        <header class="border-b border-zinc-200 shadow-sm">
+            <div class="max-w-md lg:max-w-5xl mx-auto px-4 py-3">
+                <div class="flex items-center justify-between gap-3">
+                    <div>
+                        <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Aeris Beaute</h1>
+                        <p class="text-xs text-zinc-500">Stock Opname 2026</p>
+                    </div>
+                    <nav class="flex gap-3 text-xs font-semibold shrink-0">
+                        <span class="text-violet-700">Count</span>
+                        <a href="/summary" class="text-zinc-500 hover:text-violet-700">Summary</a>
+                    </nav>
                 </div>
-                <nav class="flex gap-3 text-xs font-semibold shrink-0">
-                    <span class="text-violet-700">Count</span>
-                    <a href="/summary" class="text-zinc-500 hover:text-violet-700">Summary</a>
-                </nav>
             </div>
-        </div>
-    </header>
-
-    <div id="locationStickyBar" class="location-sticky-bar hidden" aria-live="polite">
-        <div class="max-w-md lg:max-w-5xl mx-auto px-4 py-2.5 flex items-center gap-2">
-            <span class="text-xs font-semibold uppercase tracking-wide text-emerald-800 shrink-0">Lokasi</span>
-            <span id="locationStickyValue" class="flex-1 min-w-0 text-base font-bold text-emerald-950 truncate"></span>
-            <button type="button" id="changeLocationBtn" class="shrink-0 text-xs font-semibold text-emerald-800 bg-emerald-100 hover:bg-emerald-200 px-2.5 py-1 rounded-md">Ubah</button>
+        </header>
+        <div id="locationStickyBar" class="location-sticky-bar hidden" aria-live="polite">
+            <div class="max-w-md lg:max-w-5xl mx-auto px-4 py-3 flex items-center gap-3 min-h-[3rem]">
+                <span class="text-xs font-semibold uppercase tracking-wide text-emerald-800 shrink-0">Lokasi</span>
+                <span id="locationStickyValue" class="flex-1 min-w-0 text-base sm:text-lg font-bold text-emerald-950 truncate leading-tight"></span>
+                <button type="button" id="changeLocationBtn" class="shrink-0 text-xs font-semibold text-emerald-800 bg-emerald-100 hover:bg-emerald-200 px-2.5 py-1.5 rounded-md">Ubah</button>
+            </div>
         </div>
     </div>
 
@@ -384,7 +410,7 @@ HTML_TEMPLATE = """
         <div class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 space-y-1"></div>
     </div>
 
-    <main class="flex-1 max-w-md lg:max-w-5xl w-full mx-auto px-4 py-4 pb-28 lg:pb-6 relative z-[30]">
+    <main class="flex-1 max-w-md lg:max-w-5xl w-full mx-auto px-4 py-4 pb-28 lg:pb-6 relative z-0">
 
         <!-- Stepper: Petugas → Lokasi → Produk → Jumlah -->
         <nav class="flex items-center gap-1 sm:gap-2 mb-5" aria-label="Count progress">
@@ -507,7 +533,7 @@ HTML_TEMPLATE = """
 
             <!-- History panel -->
             <div id="panelHistory" class="hidden lg:block">
-                <div class="step-card lg:sticky lg:top-4">
+                <div class="step-card opname-history-sticky lg:sticky">
                     <div class="step-card__head step-card__head--idle">
                         <h2 class="step-card__title step-card__title--idle flex-1">Riwayat</h2>
                         <button type="button" onclick="fetchHistory()" class="text-sm font-semibold text-violet-600 hover:text-violet-800">Refresh</button>
@@ -694,6 +720,27 @@ HTML_TEMPLATE = """
             if (key) lastHandledScan = { key, at: Date.now(), target: target || currentTarget };
         }
 
+        function syncTopChromeLayout() {
+            const body = document.body;
+            const chrome = document.getElementById('opnameTopChrome');
+            const bar = document.getElementById('locationStickyBar');
+            const locked = locationFrozen && bar && !bar.classList.contains('hidden');
+            if (locked && chrome) {
+                body.classList.add('opname-location-locked');
+                const h = Math.ceil(chrome.getBoundingClientRect().height);
+                body.style.setProperty('--opname-chrome-h', h + 'px');
+                // #region agent log
+                dbgLog('H-LAYOUT', 'syncTopChromeLayout', 'fixed chrome', { chromeH: h, locked: true });
+                // #endregion
+            } else {
+                body.classList.remove('opname-location-locked');
+                body.style.removeProperty('--opname-chrome-h');
+                // #region agent log
+                dbgLog('H-LAYOUT', 'syncTopChromeLayout', 'sticky chrome', { locked: false });
+                // #endregion
+            }
+        }
+
         function updateLocationStickyBar() {
             const bar = document.getElementById('locationStickyBar');
             const valEl = document.getElementById('locationStickyValue');
@@ -705,6 +752,7 @@ HTML_TEMPLATE = """
             } else {
                 bar.classList.add('hidden');
             }
+            requestAnimationFrame(syncTopChromeLayout);
         }
 
         function freezeLocation() {
@@ -956,6 +1004,10 @@ HTML_TEMPLATE = """
             showLookupWarnings(lookupWarnings);
             await loadLookups();
             await syncUIState({ refreshHistory: true });
+            syncTopChromeLayout();
+            window.addEventListener('resize', () => {
+                if (locationFrozen) syncTopChromeLayout();
+            });
             switchTab('count');
         }
 
