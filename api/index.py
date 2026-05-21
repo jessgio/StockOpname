@@ -725,7 +725,7 @@ HTML_TEMPLATE = """
                 locInput.placeholder = 'Scan kode QR lokasi';
             } else if (locInput.value.trim()) {
                 if (locationFrozen) {
-                    if (hint) hint.textContent = 'Lokasi terkunci di atas. Gunakan Ubah hanya jika pindah rak.';
+                    if (hint) hint.textContent = 'Pastikan lokasi sudah benar.';
                 } else if (hint) {
                     hint.textContent = 'Lokasi terisi. Tekan Scan untuk mengganti.';
                 }
@@ -1239,7 +1239,7 @@ HTML_TEMPLATE = """
 
         async function openScanModal(target) {
             if (target === 'location' && locationFrozen) {
-                showToast('Lokasi terkunci. Tekan Ubah di bar hijau atas untuk ganti lokasi.', 'warning');
+                showToast('Pastikan lokasi sudah benar.', 'warning');
                 return;
             }
             if (target === 'location' && document.getElementById('scanLocationBtn').disabled) return;
