@@ -29,10 +29,11 @@ def get_spreadsheet():
     return client.open("Aeris Beaute - Stock Opname Master Template")
 
 _SPREADSHEET_CACHE = {"wb": None, "expires": 0.0}
-_SUMMARY_CACHE = {"payload": None, "expires": 0.0}
+_SUMMARY_CACHE = {"by_session": {}, "expires": 0.0}
 _LOOKUPS_CACHE = {"payload": None, "expires": 0.0}
 _SKU_TREE_CACHE = {"tree": None, "expires": 0.0}
-_DUP_INDEX_CACHE = {"index": None, "expires": 0.0}
+_DUP_INDEX_CACHE = {}
+_SESSIONS_CACHE = {"sessions": None, "expires": 0.0}
 _HISTORY_CACHE = {}
 _CACHE_LOCK = Lock()
 _SPREADSHEET_CACHE_TTL = int(os.environ.get("SPREADSHEET_CACHE_SECONDS", "300"))
@@ -54,46 +55,69 @@ def get_spreadsheet_cached():
         _SPREADSHEET_CACHE["expires"] = now + _SPREADSHEET_CACHE_TTL
     return wb
 
-def invalidate_summary_cache():
+def invalidate_dup_index_cache(session_id=None):
     with _CACHE_LOCK:
-        _SUMMARY_CACHE["payload"] = None
-        _SUMMARY_CACHE["expires"] = 0.0
+        if session_id:
+            _DUP_INDEX_CACHE.pop(session_id, None)
+        else:
+            _DUP_INDEX_CACHE.clear()
 
-def invalidate_dup_index_cache():
-    with _CACHE_LOCK:
-        _DUP_INDEX_CACHE["index"] = None
-        _DUP_INDEX_CACHE["expires"] = 0.0
+def history_cache_key(session_id, counter_name):
+    return f"{session_id}|{counter_name}"
 
-def invalidate_history_cache(counter_name=None):
+def invalidate_history_cache(counter_name=None, session_id=None):
     with _CACHE_LOCK:
-        if counter_name:
-            _HISTORY_CACHE.pop(counter_name, None)
+        if session_id and counter_name:
+            _HISTORY_CACHE.pop(history_cache_key(session_id, counter_name), None)
+        elif session_id:
+            prefix = f"{session_id}|"
+            for key in list(_HISTORY_CACHE.keys()):
+                if key.startswith(prefix):
+                    _HISTORY_CACHE.pop(key, None)
+        elif counter_name:
+            for key in list(_HISTORY_CACHE.keys()):
+                if key.endswith(f"|{counter_name}"):
+                    _HISTORY_CACHE.pop(key, None)
         else:
             _HISTORY_CACHE.clear()
 
-def invalidate_count_caches(counter_name=None, invalidate_dup=True):
-    if invalidate_dup:
-        invalidate_dup_index_cache()
-    invalidate_history_cache(counter_name)
-    invalidate_summary_cache()
+def invalidate_summary_cache(session_id=None):
+    with _CACHE_LOCK:
+        if session_id:
+            entry = _SUMMARY_CACHE.get("by_session", {})
+            entry.pop(session_id, None)
+        else:
+            _SUMMARY_CACHE["by_session"] = {}
+            _SUMMARY_CACHE["expires"] = 0.0
 
-def update_dup_index_entry(counter_name, loc_string, sku_code, count):
+def invalidate_count_caches(counter_name=None, session_id=None, invalidate_dup=True):
+    if invalidate_dup:
+        invalidate_dup_index_cache(session_id)
+    invalidate_history_cache(counter_name, session_id)
+    invalidate_summary_cache(session_id)
+
+def update_dup_index_entry(session_id, counter_name, loc_string, sku_code, count):
     """Keep duplicate index warm after append without re-reading the sheet."""
     with _CACHE_LOCK:
-        idx = _DUP_INDEX_CACHE["index"]
-        if idx is None:
+        entry = _DUP_INDEX_CACHE.get(session_id)
+        if not entry or entry.get("index") is None:
             return
-        idx[(counter_name, loc_string, sku_code)] = count
+        entry["index"][(counter_name, loc_string, sku_code)] = count
 
-def read_raw_counts_for_summary(sheet):
-    """Fetch only location, SKU, and qty columns (F–H) instead of the full sheet."""
+def read_raw_counts_for_summary(sheet, session_id=None):
+    """Fetch location, SKU, qty (F–H) and filter by Session ID (K)."""
     try:
         values = sheet.get("F2:H")
+        session_col = sheet.get("K2:K")
     except Exception:
         return []
     records = []
-    for row in values:
+    for i, row in enumerate(values):
         padded = list(row) + ["", "", ""]
+        sess_cell = session_col[i] if i < len(session_col) else []
+        row_session = str(sess_cell[0] if sess_cell else "").strip()
+        if session_id and row_session != session_id:
+            continue
         records.append({
             "Precise Location": padded[0],
             "SKU Code": padded[1],
@@ -111,49 +135,57 @@ def _row_dict_from_padded(padded):
         "Physical Count": padded[7],
         "Timestamp": padded[8],
         "Notes": padded[9],
+        "Session ID": padded[10] if len(padded) > 10 else "",
     }
 
 def read_raw_count_rows(sheet, start_row=2, end_row=None):
-    """Fetch Raw Counts rows (A–J) for a row range."""
+    """Fetch Raw Counts rows (A–K) for a row range."""
     if end_row is None:
         end_row = sheet.row_count
     if end_row < start_row:
         return []
     try:
-        values = sheet.get(f"A{start_row}:J{end_row}")
+        values = sheet.get(f"A{start_row}:K{end_row}")
     except Exception:
         return []
     rows = []
     for row in values:
-        padded = list(row) + [""] * 10
+        padded = list(row) + [""] * 11
         rows.append(_row_dict_from_padded(padded))
     return rows
 
-def get_dup_index(sheet, force_refresh=False):
-    """Map (counter, location, sku) -> qty; built from columns B and F–H only."""
+def get_dup_index(sheet, session_id, force_refresh=False):
+    """Map (counter, location, sku) -> qty for one session (columns B, F–H, K)."""
     now = time.time()
     if not force_refresh:
         with _CACHE_LOCK:
-            cached = _DUP_INDEX_CACHE["index"]
-            if cached is not None and now < _DUP_INDEX_CACHE["expires"]:
-                return cached
+            entry = _DUP_INDEX_CACHE.get(session_id)
+            if entry and entry.get("index") is not None and now < entry.get("expires", 0):
+                return entry["index"]
 
     index = {}
     try:
-        batch = sheet.batch_get(["B2:B", "F2:H"])
+        batch = sheet.batch_get(["B2:B", "F2:H", "K2:K"])
         counters_col = batch[0] if batch else []
         detail_col = batch[1] if len(batch) > 1 else []
+        session_col = batch[2] if len(batch) > 2 else []
     except Exception:
         try:
             counters_col = sheet.get("B2:B")
             detail_col = sheet.get("F2:H")
+            session_col = sheet.get("K2:K")
         except Exception:
-            counters_col, detail_col = [], []
+            counters_col, detail_col, session_col = [], [], []
 
     counters_col = counters_col or []
     detail_col = detail_col or []
-    row_count = max(len(counters_col), len(detail_col))
+    session_col = session_col or []
+    row_count = max(len(counters_col), len(detail_col), len(session_col))
     for i in range(row_count):
+        s_row = session_col[i] if i < len(session_col) else []
+        row_session = str(s_row[0] if s_row else "").strip()
+        if session_id and row_session != session_id:
+            continue
         c_row = counters_col[i] if i < len(counters_col) else []
         d_row = detail_col[i] if i < len(detail_col) else []
         counter = str(c_row[0] if c_row else "").strip()
@@ -164,8 +196,10 @@ def get_dup_index(sheet, force_refresh=False):
             index[(counter, loc, sku)] = d_padded[2]
 
     with _CACHE_LOCK:
-        _DUP_INDEX_CACHE["index"] = index
-        _DUP_INDEX_CACHE["expires"] = now + _DUP_INDEX_CACHE_TTL
+        _DUP_INDEX_CACHE[session_id] = {
+            "index": index,
+            "expires": now + _DUP_INDEX_CACHE_TTL,
+        }
     return index
 
 def _history_item_from_row(row):
@@ -178,12 +212,13 @@ def _history_item_from_row(row):
         "notes": row.get("Notes") or "",
     }
 
-def fetch_counter_history(sheet, target_name, counter_lookup, force_refresh=False, full_scan=False):
-    """Return recent history for one counter without reading the entire sheet."""
+def fetch_counter_history(sheet, session_id, target_name, counter_lookup, force_refresh=False, full_scan=False):
+    """Return recent history for one counter in one session."""
+    cache_key = history_cache_key(session_id, target_name)
     now = time.time()
     if not force_refresh and not full_scan:
         with _CACHE_LOCK:
-            entry = _HISTORY_CACHE.get(target_name)
+            entry = _HISTORY_CACHE.get(cache_key)
             if entry is not None and now < entry["expires"]:
                 return entry["items"], entry.get("truncated", False), True
 
@@ -199,7 +234,8 @@ def fetch_counter_history(sheet, target_name, counter_lookup, force_refresh=Fals
     matches = [
         _history_item_from_row(row)
         for row in rows
-        if row_matches_counter(row, target_name, counter_lookup)
+        if row_matches_session(row, session_id)
+        and row_matches_counter(row, target_name, counter_lookup)
     ]
     if len(matches) > HISTORY_MAX_ITEMS:
         truncated = True
@@ -208,7 +244,7 @@ def fetch_counter_history(sheet, target_name, counter_lookup, force_refresh=Fals
     items = list(reversed(matches))
     if not full_scan:
         with _CACHE_LOCK:
-            _HISTORY_CACHE[target_name] = {
+            _HISTORY_CACHE[cache_key] = {
                 "items": items,
                 "truncated": truncated,
                 "expires": now + _HISTORY_CACHE_TTL,
@@ -257,22 +293,28 @@ def row_matches_counter(row, target_name, counter_lookup):
         return True
     return resolve_counter(row_name, counter_lookup) == target_name
 
-def find_duplicate_count(sheet, counter_name, loc_string, sku_code):
-    """O(1) duplicate lookup using a cached index of counter/location/SKU keys."""
-    index = get_dup_index(sheet)
+def row_matches_session(row, session_id):
+    if not session_id:
+        return True
+    return str(row.get("Session ID") or "").strip() == session_id
+
+def find_duplicate_count(sheet, session_id, counter_name, loc_string, sku_code):
+    """O(1) duplicate lookup for this session only."""
+    index = get_dup_index(sheet, session_id)
     return index.get((counter_name, loc_string, sku_code))
 
-def build_summary_payload(force_refresh=False):
+def build_summary_payload(session_id, force_refresh=False):
     now = time.time()
     if not force_refresh:
         with _CACHE_LOCK:
-            cached = _SUMMARY_CACHE["payload"]
-            if cached is not None and now < _SUMMARY_CACHE["expires"]:
-                return cached, True
+            by_session = _SUMMARY_CACHE.get("by_session", {})
+            entry = by_session.get(session_id)
+            if entry is not None and now < entry.get("expires", 0):
+                return entry["payload"], True
 
     wb = get_spreadsheet_cached()
     sheet = wb.worksheet("Raw Counts")
-    records = read_raw_counts_for_summary(sheet)
+    records = read_raw_counts_for_summary(sheet, session_id=session_id)
     rows, grand_total = aggregate_counts_by_sku(records)
     payload = {
         "rows": rows,
@@ -280,8 +322,12 @@ def build_summary_payload(force_refresh=False):
         "sku_count": len(rows),
     }
     with _CACHE_LOCK:
-        _SUMMARY_CACHE["payload"] = payload
-        _SUMMARY_CACHE["expires"] = now + _SUMMARY_CACHE_TTL
+        if "by_session" not in _SUMMARY_CACHE:
+            _SUMMARY_CACHE["by_session"] = {}
+        _SUMMARY_CACHE["by_session"][session_id] = {
+            "payload": payload,
+            "expires": now + _SUMMARY_CACHE_TTL,
+        }
     return payload, False
 
 COUNTER_PREFIXES = (
@@ -460,6 +506,74 @@ def resolve_counter(name, counter_lookup):
     key = normalize_scan_text(trimmed, "counter").lower()
     return counter_lookup.get(key)
 
+def _header_column_index(header_row, aliases):
+    for i, cell in enumerate(header_row):
+        if str(cell).strip().lower() in aliases:
+            return i
+    return None
+
+_SESSION_ARCHIVED = frozenset({"archived", "inactive", "closed", "ended"})
+
+def load_sessions_from_sheet(wb):
+    ws = get_worksheet_by_names(wb, ("SESSIONS", "Sessions", "Session"))
+    if not ws:
+        return []
+    try:
+        rows = ws.get_all_values()
+    except Exception:
+        return []
+    if not rows:
+        return []
+
+    headers = [str(c).strip().lower() for c in rows[0]]
+    name_idx = _header_column_index(headers, ("session name",))
+    id_idx = _header_column_index(headers, ("session id",))
+    status_idx = _header_column_index(headers, ("status",))
+    if name_idx is None:
+        name_idx = 0
+    if id_idx is None:
+        id_idx = 1
+
+    sessions = []
+    for row in rows[1:]:
+        padded = list(row) + [""] * 4
+        name = str(padded[name_idx]).strip()
+        sid = str(padded[id_idx]).strip()
+        if not name or not sid:
+            continue
+        status = str(padded[status_idx]).strip().lower() if status_idx is not None else ""
+        if status in _SESSION_ARCHIVED:
+            continue
+        sessions.append({"id": sid, "name": name, "status": status or "active"})
+    return sessions
+
+def build_sessions_payload(force_refresh=False):
+    now = time.time()
+    if not force_refresh:
+        with _CACHE_LOCK:
+            cached = _SESSIONS_CACHE.get("sessions")
+            if cached is not None and now < _SESSIONS_CACHE.get("expires", 0):
+                return cached, True
+    wb = get_spreadsheet_cached()
+    sessions = load_sessions_from_sheet(wb)
+    with _CACHE_LOCK:
+        _SESSIONS_CACHE["sessions"] = sessions
+        _SESSIONS_CACHE["expires"] = now + _LOOKUPS_CACHE_TTL
+    return sessions, False
+
+def session_by_id(sessions, session_id):
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    for s in sessions:
+        if s["id"] == sid:
+            return s
+    return None
+
+def require_valid_session_id(session_id):
+    sessions, _ = build_sessions_payload()
+    return session_by_id(sessions, session_id)
+
 def load_sku_tree(wb):
     """Build nested SKU tree from SKU List worksheet."""
     sku_tree = {}
@@ -539,6 +653,126 @@ def aggregate_counts_by_sku(records):
     ]
     grand_total = sum(r["total"] for r in rows)
     return rows, grand_total
+
+SESSION_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Start Session — Aeris Opname</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+</head>
+<body class="bg-zinc-50 font-sans text-zinc-900 antialiased min-h-screen flex flex-col">
+    <header class="border-b border-zinc-200 bg-white shadow-sm">
+        <div class="max-w-md mx-auto px-4 py-3">
+            <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Aeris Beaute</h1>
+            <p class="text-xs text-zinc-500">Stock Opname — pilih sesi</p>
+        </div>
+    </header>
+    <main class="flex-1 max-w-md w-full mx-auto px-4 py-8">
+        <div id="continueBox" class="hidden mb-6 rounded-xl border border-violet-200 bg-violet-50 px-4 py-3">
+            <p class="text-sm text-violet-900">Lanjutkan sesi:</p>
+            <p id="continueLabel" class="font-semibold text-violet-950 mt-1"></p>
+            <div class="flex gap-2 mt-3">
+                <a href="/count" class="flex-1 text-center py-2.5 rounded-lg bg-violet-600 text-white text-sm font-semibold">Ke halaman Count</a>
+                <button type="button" onclick="endStoredSession()" class="px-3 py-2.5 rounded-lg border border-violet-300 text-violet-800 text-sm font-semibold">End Session</button>
+            </div>
+        </div>
+        <div class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
+            <div>
+                <label for="sessionSelect" class="block text-sm font-semibold text-zinc-700 mb-2">Session Name</label>
+                <select id="sessionSelect" class="w-full border border-zinc-200 rounded-lg px-3 py-3 text-sm font-medium bg-white focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                    <option value="">Memuat daftar sesi…</option>
+                </select>
+            </div>
+            <button type="button" id="startSessionBtn" onclick="startSession()" disabled
+                class="w-full py-3 rounded-lg bg-violet-600 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-semibold transition">
+                Start Session
+            </button>
+            <p id="sessionError" class="hidden text-sm text-rose-600"></p>
+        </div>
+        <p class="text-xs text-zinc-400 text-center mt-6">End Session hanya di perangkat ini — tidak menutup sesi di sheet.</p>
+    </main>
+    <script>
+        const SESSION_STORAGE_KEY = 'aeris_opname_session';
+        let sessionsList = [];
+
+        function loadStoredSession() {
+            try {
+                const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+                return raw ? JSON.parse(raw) : null;
+            } catch (e) { return null; }
+        }
+
+        function endStoredSession() {
+            localStorage.removeItem(SESSION_STORAGE_KEY);
+            document.getElementById('continueBox').classList.add('hidden');
+        }
+
+        function showContinue(stored) {
+            if (!stored || !stored.sessionId) return;
+            document.getElementById('continueLabel').textContent = stored.sessionName || stored.sessionId;
+            document.getElementById('continueBox').classList.remove('hidden');
+        }
+
+        async function loadSessions() {
+            const sel = document.getElementById('sessionSelect');
+            const err = document.getElementById('sessionError');
+            try {
+                const res = await fetch('/api/sessions');
+                const data = await res.json();
+                sessionsList = data.sessions || [];
+                sel.innerHTML = '';
+                if (!sessionsList.length) {
+                    sel.innerHTML = '<option value="">Tidak ada sesi aktif di tab SESSIONS</option>';
+                    document.getElementById('startSessionBtn').disabled = true;
+                    return;
+                }
+                sessionsList.forEach(s => {
+                    const opt = document.createElement('option');
+                    opt.value = s.id;
+                    opt.textContent = s.name;
+                    sel.appendChild(opt);
+                });
+                document.getElementById('startSessionBtn').disabled = false;
+                const stored = loadStoredSession();
+                if (stored && stored.sessionId) {
+                    const match = sessionsList.find(s => s.id === stored.sessionId);
+                    if (match) sel.value = match.id;
+                }
+            } catch (e) {
+                err.textContent = 'Gagal memuat daftar sesi.';
+                err.classList.remove('hidden');
+                sel.innerHTML = '<option value="">Error</option>';
+            }
+        }
+
+        function startSession() {
+            const sel = document.getElementById('sessionSelect');
+            const err = document.getElementById('sessionError');
+            const id = sel.value;
+            const session = sessionsList.find(s => s.id === id);
+            if (!session) {
+                err.textContent = 'Pilih sesi terlebih dahulu.';
+                err.classList.remove('hidden');
+                return;
+            }
+            localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
+                sessionId: session.id,
+                sessionName: session.name,
+                startedAt: Date.now(),
+            }));
+            window.location.href = '/count';
+        }
+
+        const stored = loadStoredSession();
+        showContinue(stored);
+        loadSessions();
+    </script>
+</body>
+</html>
+"""
 
 # --- HTML INTERFACE WITH DUPLICATE PROTECTION & AUTO-RESET ---
 HTML_TEMPLATE = """
@@ -648,9 +882,13 @@ HTML_TEMPLATE = """
                         <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Aeris Beaute</h1>
                         <p class="text-xs text-zinc-500">Stock Opname 2026</p>
                     </div>
-                    <nav class="flex gap-3 text-xs font-semibold shrink-0">
-                        <span class="text-violet-700">Count</span>
-                        <a href="/summary" class="text-zinc-500 hover:text-violet-700">Summary</a>
+                    <nav class="flex flex-col items-end gap-1 text-xs font-semibold shrink-0">
+                        <div class="flex gap-3">
+                            <span class="text-violet-700">Count</span>
+                            <a href="/summary" class="text-zinc-500 hover:text-violet-700">Summary</a>
+                        </div>
+                        <p id="sessionBadge" class="text-[10px] text-zinc-500 max-w-[10rem] truncate"></p>
+                        <button type="button" onclick="endSession()" class="text-[10px] text-rose-600 hover:text-rose-800 font-semibold">End Session</button>
                     </nav>
                 </div>
             </div>
@@ -829,6 +1067,37 @@ HTML_TEMPLATE = """
     <script id="app-boot-data" type="application/json">{{ boot_data|tojson }}</script>
     <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
     <script>
+        const SESSION_STORAGE_KEY = 'aeris_opname_session';
+
+        function loadStoredSession() {
+            try {
+                const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+                return raw ? JSON.parse(raw) : null;
+            } catch (e) { return null; }
+        }
+
+        function saveStoredSession(sessionId, sessionName) {
+            localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
+                sessionId,
+                sessionName,
+                startedAt: Date.now(),
+            }));
+        }
+
+        function endSession() {
+            localStorage.removeItem(SESSION_STORAGE_KEY);
+            window.location.href = '/';
+        }
+
+        const activeSession = loadStoredSession();
+        if (!activeSession || !activeSession.sessionId) {
+            window.location.replace('/');
+        }
+
+        function sessionQueryParam() {
+            return 'session_id=' + encodeURIComponent(activeSession.sessionId);
+        }
+
         const _boot = (function () {
             try {
                 return JSON.parse(document.getElementById('app-boot-data').textContent || '{}');
@@ -1257,6 +1526,11 @@ HTML_TEMPLATE = """
             // #region agent log
             dbgLog('H0', 'initApp', 'script loaded', { counterLookupKeys: Object.keys(counterLookup).length });
             // #endregion
+            const badge = document.getElementById('sessionBadge');
+            if (badge && activeSession) {
+                badge.textContent = activeSession.sessionName || activeSession.sessionId;
+                badge.title = activeSession.sessionName || activeSession.sessionId;
+            }
             resetPageInteractionState();
             bindScanButtons();
             showLookupWarnings(lookupWarnings);
@@ -1788,7 +2062,7 @@ HTML_TEMPLATE = """
             container.innerHTML = '<p class="text-zinc-400 text-center py-8 animate-pulse">Memuat…</p>';
 
             try {
-                const qs = new URLSearchParams({ name: counterName });
+                const qs = new URLSearchParams({ name: counterName, session_id: activeSession.sessionId });
                 if (forceRefresh) qs.set('refresh', '1');
                 const response = await fetch(`/history?${qs.toString()}`);
                 const payload = await response.json();
@@ -1856,6 +2130,7 @@ HTML_TEMPLATE = """
             spinner.classList.remove('hidden');
 
             const payload = {
+                session_id: activeSession.sessionId,
                 counter_name: counterName,
                 location: resolvedLocation,
                 sku: resolvedSku,
@@ -1904,7 +2179,7 @@ HTML_TEMPLATE = """
                 const response = await fetch('/edit', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id: logId, count: parseInt(newCount) })
+                    body: JSON.stringify({ id: logId, count: parseInt(newCount), session_id: activeSession.sessionId })
                 });
                 if (response.ok) {
                     maybeFetchHistory(true);
@@ -1923,7 +2198,7 @@ HTML_TEMPLATE = """
                 const response = await fetch('/delete', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id: logId })
+                    body: JSON.stringify({ id: logId, session_id: activeSession.sessionId })
                 });
                 if (response.ok) {
                     maybeFetchHistory(true);
@@ -1957,9 +2232,13 @@ SUMMARY_HTML_TEMPLATE = """
                     <h1 class="text-lg font-bold text-zinc-900 tracking-tight">SKU Summary</h1>
                     <p class="text-xs text-zinc-500">Running totals from Raw Counts</p>
                 </div>
-                <nav class="flex gap-3 text-xs font-semibold shrink-0">
-                    <a href="/" class="text-zinc-500 hover:text-violet-700">Count</a>
-                    <span class="text-violet-700">Summary</span>
+                <nav class="flex flex-col items-end gap-1 text-xs font-semibold shrink-0">
+                    <div class="flex gap-3">
+                        <a href="/count" class="text-zinc-500 hover:text-violet-700">Count</a>
+                        <span class="text-violet-700">Summary</span>
+                    </div>
+                    <p id="summarySessionBadge" class="text-[10px] text-zinc-500 max-w-[10rem] truncate"></p>
+                    <button type="button" onclick="endSession()" class="text-[10px] text-rose-600 hover:text-rose-800 font-semibold">End Session</button>
                 </nav>
             </div>
         </div>
@@ -2001,7 +2280,25 @@ SUMMARY_HTML_TEMPLATE = """
     </main>
 
     <script>
+        const SESSION_STORAGE_KEY = 'aeris_opname_session';
         let summaryRows = [];
+
+        function loadStoredSession() {
+            try {
+                const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+                return raw ? JSON.parse(raw) : null;
+            } catch (e) { return null; }
+        }
+
+        function endSession() {
+            localStorage.removeItem(SESSION_STORAGE_KEY);
+            window.location.href = '/';
+        }
+
+        const activeSession = loadStoredSession();
+        if (!activeSession || !activeSession.sessionId) {
+            window.location.replace('/');
+        }
 
         function escapeHtml(str) {
             return String(str)
@@ -2046,10 +2343,16 @@ SUMMARY_HTML_TEMPLATE = """
         async function loadSummary(forceRefresh = false) {
             const body = document.getElementById('summaryBody');
             body.innerHTML = '<tr><td colspan="3" class="px-4 py-8 text-center text-zinc-400 animate-pulse">Loading…</td></tr>';
+            const badge = document.getElementById('summarySessionBadge');
+            if (badge) {
+                badge.textContent = activeSession.sessionName || activeSession.sessionId;
+                badge.title = badge.textContent;
+            }
 
             try {
-                const url = forceRefresh ? '/summary/data?refresh=1' : '/summary/data';
-                const res = await fetch(url);
+                const qs = new URLSearchParams({ session_id: activeSession.sessionId });
+                if (forceRefresh) qs.set('refresh', '1');
+                const res = await fetch('/summary/data?' + qs.toString());
                 const data = await res.json();
                 summaryRows = data.rows || [];
                 renderTable(summaryRows, data.grand_total || 0);
@@ -2087,7 +2390,11 @@ _FALLBACK_SKU_TREE = {
 }
 
 @app.route('/')
-def home():
+def session_page():
+    return render_template_string(SESSION_HTML_TEMPLATE)
+
+@app.route('/count')
+def count_page():
     location_lookup = {}
     counter_lookup = {}
     lookup_warnings = []
@@ -2119,6 +2426,18 @@ def home():
         lookup_warnings=lookup_warnings,
         boot_data=boot_data,
     )
+
+@app.route('/api/sessions')
+def api_sessions():
+    try:
+        force_refresh = request.args.get("refresh") in ("1", "true", "yes")
+        sessions, from_cache = build_sessions_payload(force_refresh=force_refresh)
+        response = jsonify({"sessions": sessions})
+        if from_cache and not force_refresh:
+            response.headers["Cache-Control"] = f"private, max-age={_LOOKUPS_CACHE_TTL}"
+        return response, 200
+    except Exception as e:
+        return jsonify({"sessions": [], "error": str(e)}), 500
 
 @app.route('/api/lookups')
 def api_lookups():
@@ -2152,8 +2471,13 @@ def summary_page():
 @app.route('/summary/data')
 def summary_data():
     try:
+        session_id = request.args.get("session_id", "").strip()
+        if not session_id:
+            return jsonify({"rows": [], "grand_total": 0, "sku_count": 0, "error": "session_id required"}), 400
+        if not require_valid_session_id(session_id):
+            return jsonify({"rows": [], "grand_total": 0, "sku_count": 0, "error": "Invalid session"}), 400
         force_refresh = request.args.get("refresh") in ("1", "true", "yes")
-        payload, from_cache = build_summary_payload(force_refresh=force_refresh)
+        payload, from_cache = build_summary_payload(session_id, force_refresh=force_refresh)
         response = jsonify(payload)
         if from_cache and not force_refresh:
             response.headers["Cache-Control"] = f"private, max-age={_SUMMARY_CACHE_TTL}"
@@ -2164,9 +2488,12 @@ def summary_data():
 @app.route('/history', methods=['GET'])
 def history():
     try:
+        session_id = request.args.get("session_id", "").strip()
         raw_name = request.args.get('name', '').strip()
-        if not raw_name:
+        if not session_id or not raw_name:
             return jsonify({"items": [], "truncated": False}), 200
+        if not require_valid_session_id(session_id):
+            return jsonify({"items": [], "truncated": False, "error": "Invalid session"}), 400
 
         force_refresh = request.args.get("refresh") in ("1", "true", "yes")
         full_scan = request.args.get("full") in ("1", "true", "yes")
@@ -2177,6 +2504,7 @@ def history():
         sheet = wb.worksheet("Raw Counts")
         items, truncated, from_cache = fetch_counter_history(
             sheet,
+            session_id,
             target_name,
             counter_lookup,
             force_refresh=force_refresh,
@@ -2193,6 +2521,12 @@ def history():
 def submit():
     try:
         data = request.json
+        session_id = str(data.get("session_id", "")).strip()
+        if not session_id:
+            return jsonify({"status": "error", "message": "Sesi tidak dipilih. Kembali ke halaman Start Session."}), 400
+        if not require_valid_session_id(session_id):
+            return jsonify({"status": "error", "message": "Sesi tidak valid. Pilih sesi dari daftar."}), 400
+
         wb = get_spreadsheet_cached()
         sheet = wb.worksheet("Raw Counts")
 
@@ -2243,7 +2577,7 @@ def submit():
                 "message": f"SKU tidak valid: {raw_sku}. Pilih atau scan SKU dari daftar.",
             }), 400
 
-        dup_count = find_duplicate_count(sheet, counter_name, loc_string, sku_code)
+        dup_count = find_duplicate_count(sheet, session_id, counter_name, loc_string, sku_code)
         if dup_count is not None:
             return jsonify({
                 "status": "duplicate",
@@ -2284,13 +2618,14 @@ def submit():
             sku_code,            # Column G: SKU Code
             physical_count,    # Column H: Physical Count
             timestamp,           # Column I: Timestamp
-            notes                # Column J: Notes
+            notes,               # Column J: Notes
+            session_id,          # Column K: Session ID
         ]
         
         sheet.append_row(row_to_append)
-        invalidate_history_cache(counter_name)
-        invalidate_summary_cache()
-        update_dup_index_entry(counter_name, loc_string, sku_code, physical_count)
+        invalidate_history_cache(counter_name, session_id)
+        invalidate_summary_cache(session_id)
+        update_dup_index_entry(session_id, counter_name, loc_string, sku_code, physical_count)
         return jsonify({"status": "success"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -2301,6 +2636,7 @@ def edit():
         data = request.json
         log_id = data['id']
         new_count = data['count']
+        session_id = str(data.get("session_id", "")).strip() or None
         
         wb = get_spreadsheet_cached()
         sheet = wb.worksheet("Raw Counts")
@@ -2308,7 +2644,7 @@ def edit():
         
         if cell:
             sheet.update_cell(cell.row, 8, new_count)  # Column H: Physical Count
-            invalidate_count_caches(invalidate_dup=True)
+            invalidate_count_caches(session_id=session_id, invalidate_dup=True)
             return jsonify({"status": "success"}), 200
         return jsonify({"status": "error", "message": "Record row not found"}), 404
     except Exception as e:
@@ -2319,6 +2655,7 @@ def delete():
     try:
         data = request.json
         log_id = data['id']
+        session_id = str(data.get("session_id", "")).strip()
         
         wb = get_spreadsheet_cached()
         sheet = wb.worksheet("Raw Counts")
@@ -2326,7 +2663,7 @@ def delete():
         
         if cell:
             sheet.delete_rows(cell.row)
-            invalidate_count_caches()
+            invalidate_count_caches(session_id=session_id or None, invalidate_dup=True)
             return jsonify({"status": "success"}), 200
         return jsonify({"status": "error", "message": "Record row not found"}), 404
     except Exception as e:
