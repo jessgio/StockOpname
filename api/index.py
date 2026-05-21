@@ -24,9 +24,9 @@ def get_spreadsheet():
     client = gspread.authorize(creds)
     return client.open("Aeris Beaute - Stock Opname Master Template")
 
-def normalize_location_code(code):
-    """Normalize scanned or sheet values for reliable matching."""
-    s = str(code or "").strip().replace("\ufeff", "").replace("\u200b", "")
+def normalize_scan_text(code):
+    """Normalize QR payload or sheet cell for reliable matching."""
+    s = str(code or "").strip().replace("\ufeff", "").replace("\u200b", "").replace("\r", "").replace("\n", "")
     if not s:
         return ""
     lower = s.lower()
@@ -36,71 +36,106 @@ def normalize_location_code(code):
         s = s.split("?")[0]
     if "#" in s:
         s = s.split("#")[0]
+    s = s.strip()
+    for prefix in (
+        "loc:", "location:", "lokasi:", "kode lokasi:",
+        "counter:", "counter name:", "name:", "nama:", "petugas:", "id:", "badge:",
+    ):
+        if s.lower().startswith(prefix):
+            s = s[len(prefix):].strip()
+            break
     return s.strip()
 
-def get_locations_worksheet(wb):
-    for name in ("LOCATIONS", "Locations", "Location"):
+def get_worksheet_by_names(wb, names):
+    for name in names:
         try:
             return wb.worksheet(name)
         except Exception:
             continue
     return None
 
-def get_valid_locations(wb):
-    """Return dict of normalized key -> canonical location code from LOCATIONS column A."""
-    ws = get_locations_worksheet(wb)
-    if not ws:
-        return {}
-
+def read_codes_from_sheet(ws, header_aliases, default_col=0):
+    """Read codes from the first matching header column, else column A."""
     try:
-        col_a = ws.col_values(1)
+        rows = ws.get_all_values()
     except Exception:
-        return {}
+        return []
 
+    if not rows:
+        return []
+
+    header_aliases_lower = {h.lower() for h in header_aliases}
+    col_idx = default_col
+    data_start = 0
+
+    header_cells = [str(c).strip().lower() for c in rows[0]]
+    for i, cell in enumerate(header_cells):
+        if cell in header_aliases_lower:
+            col_idx = i
+            data_start = 1
+            break
+    else:
+        if header_cells and header_cells[default_col] in header_aliases_lower:
+            data_start = 1
+
+    codes = []
+    for row in rows[data_start:]:
+        if col_idx >= len(row):
+            continue
+        val = str(row[col_idx]).strip()
+        if val:
+            codes.append(val)
+    return codes
+
+def build_lookup(codes):
+    """Map normalized lowercase key -> canonical value from sheet."""
     lookup = {}
-    header_names = {"location", "lokasi", "precise location", "locations", "kode lokasi"}
-    for i, val in enumerate(col_a):
-        canonical = str(val).strip()
+    for raw in codes:
+        canonical = str(raw).strip()
         if not canonical:
             continue
-        if i == 0 and canonical.lower() in header_names:
-            continue
-        key = normalize_location_code(canonical).lower()
+        key = normalize_scan_text(canonical).lower()
         if key:
             lookup[key] = canonical
     return lookup
 
+def get_valid_locations(wb):
+    ws = get_worksheet_by_names(wb, ("LOCATIONS", "Locations", "Location"))
+    if not ws:
+        return {}
+    codes = read_codes_from_sheet(
+        ws,
+        ("location", "lokasi", "precise location", "locations", "kode lokasi", "code", "kode"),
+    )
+    return build_lookup(codes)
+
 def resolve_location(code, location_lookup):
-    """Match scanned text to a canonical location from the lookup."""
     if not code or not location_lookup:
         return None
     trimmed = str(code).strip()
     if trimmed in location_lookup.values():
         return trimmed
-    key = normalize_location_code(trimmed).lower()
+    key = normalize_scan_text(trimmed).lower()
     return location_lookup.get(key)
 
 def get_valid_counters(wb):
-    """Return a set of allowed counter names from COUNTERS column A."""
-    try:
-        ws = wb.worksheet("COUNTERS")
-        col_a = ws.col_values(1)
-    except Exception:
-        return set()
+    ws = get_worksheet_by_names(wb, ("COUNTERS", "Counters", "Counter"))
+    if not ws:
+        return {}
+    codes = read_codes_from_sheet(
+        ws,
+        ("counter", "counter name", "nama", "nama petugas", "petugas", "name", "counters", "id badge", "badge", "kode"),
+    )
+    return build_lookup(codes)
 
-    counters = set()
-    header_names = {
-        "counter", "counter name", "nama", "nama petugas", "petugas",
-        "name", "counters", "id badge", "badge",
-    }
-    for i, val in enumerate(col_a):
-        name = str(val).strip()
-        if not name:
-            continue
-        if i == 0 and name.lower() in header_names:
-            continue
-        counters.add(name)
-    return counters
+def resolve_counter(name, counter_lookup):
+    if not name or not counter_lookup:
+        return None
+    trimmed = str(name).strip()
+    if trimmed in counter_lookup.values():
+        return trimmed
+    key = normalize_scan_text(trimmed).lower()
+    return counter_lookup.get(key)
 
 def get_row_counter_name(row):
     """Read counter from new or legacy column header."""
@@ -309,11 +344,13 @@ HTML_TEMPLATE = """
 
     <script>
         const skuTree = {{ sku_tree|tojson|safe }};
-        const validLocations = new Set({{ valid_locations|tojson|safe }});
-        const locationLookup = {{ location_lookup|tojson|safe }};
-        const validCounters = new Set({{ valid_counters|tojson|safe }});
+        let locationLookup = {{ location_lookup|tojson|safe }};
+        let counterLookup = {{ counter_lookup|tojson|safe }};
+        let validLocations = new Set({{ valid_locations|tojson|safe }});
+        let validCounters = new Set({{ valid_counters|tojson|safe }});
         let currentTarget = '';
         let scannerRunning = false;
+        let scanConfirm = { text: '', count: 0, at: 0 };
         const html5QrcodeScanner = new Html5Qrcode("reader");
 
         const CLS = {
@@ -331,7 +368,59 @@ HTML_TEMPLATE = """
             done: "shrink-0 flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold border-2 border-emerald-500 bg-emerald-500 text-white",
         };
 
-        window.onload = () => {
+        function applyLookupData(data) {
+            locationLookup = data.locations || {};
+            counterLookup = data.counters || {};
+            validLocations = new Set(Object.values(locationLookup));
+            validCounters = new Set(Object.values(counterLookup));
+        }
+
+        async function loadLookups() {
+            try {
+                const res = await fetch('/api/lookups');
+                if (res.ok) {
+                    applyLookupData(await res.json());
+                }
+            } catch (e) {}
+        }
+
+        function resetScanConfirm() {
+            scanConfirm = { text: '', count: 0, at: 0 };
+        }
+
+        function normalizeScanText(code) {
+            let s = String(code || '').trim().replace(/\ufeff/g, '').replace(/\u200b/g, '').replace(/\r/g, '').replace(/\n/g, '');
+            if (!s) return '';
+            if (/^https?:\/\//i.test(s) || s.includes('://')) {
+                s = s.replace(/\/+$/, '').split('/').pop();
+            }
+            if (s.includes('?')) s = s.split('?')[0];
+            if (s.includes('#')) s = s.split('#')[0];
+            s = s.trim();
+            const prefixes = ['loc:', 'location:', 'lokasi:', 'kode lokasi:', 'counter:', 'counter name:', 'name:', 'nama:', 'petugas:', 'id:', 'badge:'];
+            for (const p of prefixes) {
+                if (s.toLowerCase().startsWith(p)) {
+                    s = s.slice(p.length).trim();
+                    break;
+                }
+            }
+            return s.trim();
+        }
+
+        function isScanConfirmed(raw) {
+            const text = normalizeScanText(raw);
+            if (!text) return false;
+            const now = Date.now();
+            if (scanConfirm.text === text && now - scanConfirm.at < 2500) {
+                scanConfirm.count += 1;
+            } else {
+                scanConfirm = { text, count: 1, at: now };
+            }
+            return scanConfirm.count >= 2;
+        }
+
+        window.onload = async () => {
+            await loadLookups();
             lockAfterCounter();
             updateStepperUI();
             updateSubmitState();
@@ -431,22 +520,30 @@ HTML_TEMPLATE = """
             btn.disabled = !ready || btn.dataset.loading === '1';
         }
 
+        function resolveCounter(name) {
+            const trimmed = String(name || '').trim();
+            if (!trimmed) return null;
+            if (validCounters.has(trimmed)) return trimmed;
+            const key = normalizeScanText(trimmed).toLowerCase();
+            return counterLookup[key] || null;
+        }
+
         function isValidCounter(name) {
-            const trimmed = String(name).trim();
-            return trimmed && validCounters.has(trimmed);
+            return !!resolveCounter(name);
         }
 
         function applyCounterScan(text) {
-            const trimmed = text.trim();
-            if (!validCounters.size) {
+            if (!Object.keys(counterLookup).length) {
                 showToast('Daftar petugas belum dimuat. Hubungi admin.', 'error');
                 return false;
             }
-            if (!isValidCounter(trimmed)) {
-                showToast('ID badge tidak dikenali. Scan badge yang benar atau ketik nama sesuai daftar.', 'warning');
+            const resolved = resolveCounter(text);
+            if (!resolved) {
+                const scanned = normalizeScanText(text) || String(text).trim();
+                showToast(`Petugas tidak dikenali: "${scanned.slice(0, 40)}". Periksa tab COUNTERS.`, 'warning');
                 return false;
             }
-            document.getElementById('counterName').value = trimmed;
+            document.getElementById('counterName').value = resolved;
             unlockAfterCounter();
             return true;
         }
@@ -505,22 +602,11 @@ HTML_TEMPLATE = """
             }, type === 'warning' ? 6000 : 3500);
         }
 
-        function normalizeLocation(code) {
-            let s = String(code || '').trim().replace(/\ufeff/g, '').replace(/\u200b/g, '');
-            if (!s) return '';
-            if (/^https?:\/\//i.test(s) || s.includes('://')) {
-                s = s.replace(/\/+$/, '').split('/').pop();
-            }
-            if (s.includes('?')) s = s.split('?')[0];
-            if (s.includes('#')) s = s.split('#')[0];
-            return s.trim();
-        }
-
         function resolveLocation(code) {
             const trimmed = String(code || '').trim();
             if (!trimmed) return null;
             if (validLocations.has(trimmed)) return trimmed;
-            const key = normalizeLocation(trimmed).toLowerCase();
+            const key = normalizeScanText(trimmed).toLowerCase();
             return locationLookup[key] || null;
         }
 
@@ -539,7 +625,7 @@ HTML_TEMPLATE = """
             }
             const resolved = resolveLocation(text);
             if (!resolved) {
-                const scanned = normalizeLocation(text) || String(text).trim();
+                const scanned = normalizeScanText(text) || String(text).trim();
                 showToast(`Lokasi tidak dikenali: "${scanned.slice(0, 40)}". Periksa tab LOCATIONS.`, 'warning');
                 return false;
             }
@@ -651,6 +737,7 @@ HTML_TEMPLATE = """
             document.getElementById('scanModalTitle').textContent = scanTitles[target] || 'Scan QR';
             document.getElementById('scanModal').classList.remove('hidden');
             document.body.classList.add('overflow-hidden');
+            resetScanConfirm();
 
             await new Promise(r => setTimeout(r, 150));
 
@@ -662,20 +749,24 @@ HTML_TEMPLATE = """
                     { fps: 15, qrbox: { width: 250, height: 250 } },
                     async (decodedText) => {
                         const text = decodedText.trim();
+                        if (!isScanConfirmed(text)) return;
+
+                        let shouldClose = false;
                         if (currentTarget === 'counter') {
-                            applyCounterScan(text);
+                            shouldClose = applyCounterScan(text);
                         } else if (currentTarget === 'location') {
-                            applyLocationScan(text);
+                            shouldClose = applyLocationScan(text);
                         } else if (currentTarget === 'sku') {
                             let found = false;
+                            const skuText = normalizeScanText(text) || text;
                             for (const type in skuTree) {
                                 for (const cat in skuTree[type]) {
-                                    if (skuTree[type][cat].includes(text)) {
+                                    if (skuTree[type][cat].includes(skuText) || skuTree[type][cat].includes(text)) {
                                         document.getElementById('skuType').value = type;
                                         updateCategories();
                                         document.getElementById('skuCategory').value = cat;
                                         updateSkus();
-                                        document.getElementById('skuSelector').value = text;
+                                        document.getElementById('skuSelector').value = skuTree[type][cat].includes(skuText) ? skuText : text;
                                         found = true;
                                         break;
                                     }
@@ -683,13 +774,14 @@ HTML_TEMPLATE = """
                                 if (found) break;
                             }
                             if (!found) {
-                                showToast('SKU not found: ' + text, 'warning');
+                                showToast('SKU not found: ' + skuText, 'warning');
                             } else {
                                 updateStepperUI();
                                 updateSubmitState();
+                                shouldClose = true;
                             }
                         }
-                        await closeScanModal();
+                        if (shouldClose) await closeScanModal();
                     },
                     () => {}
                 );
@@ -1018,12 +1110,14 @@ def home():
     sku_tree = {}
     valid_locations = []
     location_lookup = {}
+    counter_lookup = {}
     valid_counters = []
     try:
         wb = get_spreadsheet()
         location_lookup = get_valid_locations(wb)
+        counter_lookup = get_valid_counters(wb)
         valid_locations = sorted(set(location_lookup.values()))
-        valid_counters = sorted(get_valid_counters(wb))
+        valid_counters = sorted(set(counter_lookup.values()))
         sku_worksheet = wb.worksheet("SKU List")
         list_of_lists = sku_worksheet.get_all_values()
         
@@ -1064,8 +1158,30 @@ def home():
         sku_tree=sku_tree,
         valid_locations=valid_locations,
         location_lookup=location_lookup,
+        counter_lookup=counter_lookup,
         valid_counters=valid_counters,
     )
+
+@app.route('/api/lookups')
+def api_lookups():
+    try:
+        wb = get_spreadsheet()
+        location_lookup = get_valid_locations(wb)
+        counter_lookup = get_valid_counters(wb)
+        return jsonify({
+            "locations": location_lookup,
+            "counters": counter_lookup,
+            "location_count": len(location_lookup),
+            "counter_count": len(counter_lookup),
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "locations": {},
+            "counters": {},
+            "location_count": 0,
+            "counter_count": 0,
+            "error": str(e),
+        }), 500
 
 @app.route('/summary')
 def summary_page():
@@ -1116,16 +1232,16 @@ def submit():
         wb = get_spreadsheet()
         sheet = wb.worksheet("Raw Counts")
         
-        counter_name = str(data.get('counter_name', '')).strip()
-        valid_counters = get_valid_counters(wb)
+        counter_lookup = get_valid_counters(wb)
+        counter_name = resolve_counter(data.get('counter_name', ''), counter_lookup)
 
-        if not valid_counters:
+        if not counter_lookup:
             return jsonify({
                 "status": "error",
                 "message": "Daftar petugas tidak tersedia. Periksa tab COUNTERS di sheet.",
             }), 400
 
-        if not counter_name or counter_name not in valid_counters:
+        if not counter_name:
             return jsonify({
                 "status": "invalid_counter",
                 "message": "Nama petugas tidak valid. Scan ID badge atau ketik nama yang benar.",
