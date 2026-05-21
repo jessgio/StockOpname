@@ -1,0 +1,10 @@
+{"sessionId":"8114e2","runId":"pre-fix","hypothesisId":"A","location":"boot","message":"parsed","data":{"counterLookupKeys":0,"html5Defined":true},"timestamp":1779353955031}
+{"sessionId":"8114e2","runId":"pre-fix","hypothesisId":"A","location":"initApp","message":"start","data":{"readyState":"interactive"},"timestamp":1779353955034}
+{"sessionId":"8114e2","runId":"pre-fix","hypothesisId":"C","location":"bindScanButtons","message":"elements","data":{"counterFound":true,"counterDisabled":false,"openScanModalType":"function","hitTestId":"scanCounterBtn","modalHidden":true,"modalDisplay":"none"},"timestamp":1779353955036}
+{"sessionId":"8114e2","runId":"pre-fix","hypothesisId":"A","location":"initApp","message":"done","data":{},"timestamp":1779353955104}
+{"sessionId":"8114e2","runId":"pre-fix","hypothesisId":"C","location":"scanCounterBtn","message":"pointerdown","data":{},"timestamp":1779353956717}
+{"sessionId":"8114e2","runId":"pre-fix","hypothesisId":"B","location":"scanCounterBtn","message":"click","data":{"openScanModalType":"function"},"timestamp":1779353956863}
+{"sessionId":"8114e2","runId":"pre-fix","hypothesisId":"B","location":"openScanModal","message":"entry","data":{"target":"counter","html5Defined":true,"locBtnDisabled":true},"timestamp":1779353956865}
+{"sessionId":"8114e2","runId":"pre-fix","hypothesisId":"D","location":"openScanModal","message":"modalShown","data":{"hidden":false,"display":"block","isOpen":true},"timestamp":1779353956866}
+{"sessionId":"8114e2","runId":"pre-fix","hypothesisId":"D","location":"openScanModal","message":"scannerStart","data":{"target":"counter"},"timestamp":1779353957070}
+{"sessionId":"8114e2","runId":"pre-fix","hypothesisId":"D","location":"closeScanModal","message":"called","data":{"stack":"Error\n    at closeScanModal (http://127.0.0.1:5000/:966:54)\n    at HTMLButtonElement.onclick (http://127.0.0.1:5000/:217:138)"},"timestamp":1779353958742}

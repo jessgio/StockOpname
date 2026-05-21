@@ -24,8 +24,16 @@ def get_spreadsheet():
     client = gspread.authorize(creds)
     return client.open("Aeris Beaute - Stock Opname Master Template")
 
-def normalize_scan_text(code):
-    """Normalize QR payload or sheet cell for reliable matching."""
+COUNTER_PREFIXES = (
+    "counter:", "counter name:", "name:", "nama:", "nama petugas:",
+    "petugas:", "id:", "badge:", "id badge:",
+)
+LOCATION_PREFIXES = (
+    "loc:", "location:", "lokasi:", "kode lokasi:", "precise location:",
+)
+
+def normalize_scan_text(code, kind="any"):
+    """Normalize QR payload or sheet cell. kind: 'counter', 'location', or 'any'."""
     s = str(code or "").strip().replace("\ufeff", "").replace("\u200b", "").replace("\r", "").replace("\n", "")
     if not s:
         return ""
@@ -37,10 +45,13 @@ def normalize_scan_text(code):
     if "#" in s:
         s = s.split("#")[0]
     s = s.strip()
-    for prefix in (
-        "loc:", "location:", "lokasi:", "kode lokasi:",
-        "counter:", "counter name:", "name:", "nama:", "petugas:", "id:", "badge:",
-    ):
+    if kind == "counter":
+        prefixes = COUNTER_PREFIXES
+    elif kind == "location":
+        prefixes = LOCATION_PREFIXES
+    else:
+        prefixes = COUNTER_PREFIXES + LOCATION_PREFIXES
+    for prefix in prefixes:
         if s.lower().startswith(prefix):
             s = s[len(prefix):].strip()
             break
@@ -87,27 +98,34 @@ def read_codes_from_sheet(ws, header_aliases, default_col=0):
             codes.append(val)
     return codes
 
-def build_lookup(codes):
-    """Map normalized lowercase key -> canonical value from sheet."""
+def build_lookup(codes, sheet_label="", normalize_kind="any"):
+    """Map normalized lowercase key -> canonical value. Returns (lookup, warning_messages)."""
     lookup = {}
+    warnings = []
     for raw in codes:
         canonical = str(raw).strip()
         if not canonical:
             continue
-        key = normalize_scan_text(canonical).lower()
-        if key:
-            lookup[key] = canonical
-    return lookup
+        key = normalize_scan_text(canonical, normalize_kind).lower()
+        if not key:
+            continue
+        if key in lookup and lookup[key] != canonical:
+            prefix = f"{sheet_label}: " if sheet_label else ""
+            warnings.append(
+                f"{prefix}'{lookup[key]}' bentrok dengan '{canonical}' (kode sama setelah normalisasi)"
+            )
+        lookup[key] = canonical
+    return lookup, warnings
 
 def get_valid_locations(wb):
     ws = get_worksheet_by_names(wb, ("LOCATIONS", "Locations", "Location"))
     if not ws:
-        return {}
+        return {}, []
     codes = read_codes_from_sheet(
         ws,
         ("location", "lokasi", "precise location", "locations", "kode lokasi", "code", "kode"),
     )
-    return build_lookup(codes)
+    return build_lookup(codes, "LOCATIONS", "location")
 
 def resolve_location(code, location_lookup):
     if not code or not location_lookup:
@@ -115,18 +133,18 @@ def resolve_location(code, location_lookup):
     trimmed = str(code).strip()
     if trimmed in location_lookup.values():
         return trimmed
-    key = normalize_scan_text(trimmed).lower()
+    key = normalize_scan_text(trimmed, "location").lower()
     return location_lookup.get(key)
 
 def get_valid_counters(wb):
     ws = get_worksheet_by_names(wb, ("COUNTERS", "Counters", "Counter"))
     if not ws:
-        return {}
+        return {}, []
     codes = read_codes_from_sheet(
         ws,
         ("counter", "counter name", "nama", "nama petugas", "petugas", "name", "counters", "id badge", "badge", "kode"),
     )
-    return build_lookup(codes)
+    return build_lookup(codes, "COUNTERS", "counter")
 
 def resolve_counter(name, counter_lookup):
     if not name or not counter_lookup:
@@ -134,8 +152,52 @@ def resolve_counter(name, counter_lookup):
     trimmed = str(name).strip()
     if trimmed in counter_lookup.values():
         return trimmed
-    key = normalize_scan_text(trimmed).lower()
+    key = normalize_scan_text(trimmed, "counter").lower()
     return counter_lookup.get(key)
+
+def load_sku_tree(wb):
+    """Build nested SKU tree from SKU List worksheet."""
+    sku_tree = {}
+    try:
+        sku_worksheet = wb.worksheet("SKU List")
+        list_of_lists = sku_worksheet.get_all_values()
+        if len(list_of_lists) > 1:
+            headers = list_of_lists[0]
+            sku_idx = headers.index("SKU Code") if "SKU Code" in headers else 0
+            type_idx = headers.index("SKU Type") if "SKU Type" in headers else 1
+            cat_idx = headers.index("SKU Category") if "SKU Category" in headers else 2
+            for row in list_of_lists[1:]:
+                if len(row) <= max(sku_idx, type_idx, cat_idx):
+                    continue
+                sku_code = str(row[sku_idx]).strip()
+                goods_type = str(row[type_idx]).strip() or "General Goods"
+                category = str(row[cat_idx]).strip() or "Unassigned"
+                if not sku_code:
+                    continue
+                if goods_type not in sku_tree:
+                    sku_tree[goods_type] = {}
+                if category not in sku_tree[goods_type]:
+                    sku_tree[goods_type][category] = []
+                if sku_code not in sku_tree[goods_type][category]:
+                    sku_tree[goods_type][category].append(sku_code)
+    except Exception:
+        pass
+    return sku_tree
+
+def resolve_sku(code, sku_tree):
+    """Match scanned or submitted SKU to a code in the SKU tree."""
+    if not code or not sku_tree:
+        return None
+    trimmed = str(code).strip()
+    for goods_type in sku_tree.values():
+        for skus in goods_type.values():
+            if trimmed in skus:
+                return trimmed
+            key = normalize_scan_text(trimmed).lower()
+            for sku in skus:
+                if normalize_scan_text(sku).lower() == key:
+                    return sku
+    return None
 
 def get_row_counter_name(row):
     """Read counter from new or legacy column header."""
@@ -179,157 +241,231 @@ HTML_TEMPLATE = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Aeris Opname 2026</title>
+    <style>
+        #scanModal { display: none !important; visibility: hidden !important; pointer-events: none !important; }
+        #scanModal.is-open { display: block !important; visibility: visible !important; pointer-events: auto !important; }
+        #toast { pointer-events: none !important; }
+        #step1Card { position: relative; z-index: 50; pointer-events: auto !important; }
+        #step1Card input, #step1Card button { pointer-events: auto !important; touch-action: manipulation; }
+        .opname-field {
+            font-family: inherit;
+            font-size: 1rem;
+            line-height: 1.5;
+            font-weight: 600;
+        }
+        .opname-field::placeholder { font-weight: 500; color: rgb(251 191 36 / 0.75); }
+        .step-card { border-radius: 0.75rem; border: 1px solid #e4e4e7; background: #fff; box-shadow: 0 1px 2px rgb(0 0 0 / 0.05); overflow: hidden; transition: opacity 0.2s, border-color 0.2s; }
+        .step-card--active { border-color: #ddd6fe; border-width: 2px; }
+        .step-card__head { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1rem; border-bottom: 1px solid #f4f4f5; }
+        .step-card__head--active { background: rgb(245 243 255 / 0.9); border-bottom-color: #ede9fe; }
+        .step-card__head--idle { background: #fafafa; }
+        .step-card__badge { font-size: 0.75rem; font-weight: 600; padding: 0.125rem 0.5rem; border-radius: 0.25rem; }
+        .step-card__badge--active { color: #6d28d9; background: #ede9fe; }
+        .step-card__badge--idle { color: #71717a; background: #f4f4f5; }
+        .step-card__title { font-size: 0.875rem; font-weight: 600; }
+        .step-card__title--active { color: #4c1d95; }
+        .step-card__title--idle { color: #52525b; }
+        .step-locked { opacity: 0.65; }
+        .step-locked button, .step-locked select { pointer-events: none; }
+        .step-locked input:not([readonly]) { pointer-events: none; }
+    </style>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-    <script src="https://unpkg.com/html5-qrcode"></script>
 </head>
 <body class="bg-zinc-50 font-sans text-zinc-900 antialiased min-h-screen flex flex-col">
+    <script>
+        (function () {
+            function unblockPage() {
+                document.body.style.overflow = '';
+                document.body.style.pointerEvents = '';
+                var modal = document.getElementById('scanModal');
+                if (modal) {
+                    modal.hidden = true;
+                    modal.classList.remove('is-open');
+                    modal.style.display = 'none';
+                }
+            }
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', unblockPage);
+            } else {
+                unblockPage();
+            }
+            window.addEventListener('pageshow', unblockPage);
+        })();
+    </script>
 
     <!-- Toast -->
     <div id="toast" class="fixed top-4 left-4 right-4 z-[60] mx-auto max-w-md translate-y-[-120%] opacity-0 transition-all duration-300 pointer-events-none">
         <div id="toastInner" class="rounded-xl px-4 py-3 text-sm font-medium shadow-lg border"></div>
     </div>
 
-    <!-- Sticky header: brand + counter + location -->
-    <header class="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-zinc-200 shadow-sm">
-        <div class="max-w-md lg:max-w-5xl mx-auto px-4 pt-3 pb-3">
-            <div class="flex items-center justify-between gap-3 mb-1">
-                <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Aeris Beaute</h1>
+    <!-- Header: brand only (inputs live in main — avoids sticky-header tap/focus bugs on mobile) -->
+    <header class="relative z-10 bg-white border-b border-zinc-200 shadow-sm">
+        <div class="max-w-md lg:max-w-5xl mx-auto px-4 py-3">
+            <div class="flex items-center justify-between gap-3">
+                <div>
+                    <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Aeris Beaute</h1>
+                    <p class="text-xs text-zinc-500">Stock Opname 2026</p>
+                </div>
                 <nav class="flex gap-3 text-xs font-semibold shrink-0">
                     <span class="text-violet-700">Count</span>
                     <a href="/summary" class="text-zinc-500 hover:text-violet-700">Summary</a>
                 </nav>
             </div>
-            <p class="text-xs text-zinc-500 mb-3">Stock Opname 2026</p>
-            <div class="space-y-3">
-                <div>
-                    <label for="counterName" class="block text-xs font-medium text-zinc-600 mb-1">Petugas</label>
-                    <div class="flex gap-2">
-                        <input type="text" id="counterName" autocomplete="off" onblur="onCounterNameInput()" placeholder="Scan ID badge atau ketik nama" class="flex-1 min-w-0 border border-amber-200 p-2.5 rounded-lg bg-amber-50 text-sm font-semibold text-amber-800 placeholder-amber-400/80 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
-                        <button type="button" onclick="openScanModal('counter')" class="shrink-0 px-3 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold transition">Scan</button>
-                    </div>
-                </div>
-                <div>
-                    <label for="location" class="block text-xs font-medium text-zinc-600 mb-1">Lokasi</label>
-                    <div class="flex gap-2">
-                        <input type="text" id="location" readonly placeholder="Scan ID badge dulu" class="flex-1 min-w-0 border border-amber-200 p-2.5 rounded-lg bg-amber-50 font-mono text-sm font-semibold text-amber-800 placeholder-amber-400/80">
-                        <button type="button" id="scanLocationBtn" onclick="openScanModal('location')" disabled class="shrink-0 px-3 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold transition disabled:opacity-40 disabled:cursor-not-allowed">Scan</button>
-                    </div>
-                </div>
-            </div>
         </div>
     </header>
 
-    <main class="flex-1 max-w-md lg:max-w-5xl w-full mx-auto px-4 py-4 pb-28 lg:pb-6">
+    <div id="lookupWarnings" class="hidden max-w-md lg:max-w-5xl mx-auto px-4">
+        <div class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 space-y-1"></div>
+    </div>
 
-        <!-- Stepper -->
-        <nav class="flex items-center gap-2 mb-5" aria-label="Count progress">
-            <div id="step1Indicator" class="flex-1 flex items-center gap-2 min-w-0">
-                <span id="step1Dot" class="shrink-0 flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold border-2 border-violet-600 bg-violet-600 text-white">1</span>
-                <span class="text-xs font-medium text-zinc-700 truncate hidden sm:inline">Location</span>
+    <main class="flex-1 max-w-md lg:max-w-5xl w-full mx-auto px-4 py-4 pb-28 lg:pb-6 relative z-0">
+
+        <!-- Stepper: Petugas → Lokasi → Produk → Jumlah -->
+        <nav class="flex items-center gap-1 sm:gap-2 mb-5" aria-label="Count progress">
+            <div id="step1Indicator" class="flex-1 flex items-center gap-1 min-w-0">
+                <span id="step1Dot" class="shrink-0 flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-full text-xs font-bold border-2 border-violet-600 bg-violet-600 text-white">1</span>
+                <span class="text-[10px] sm:text-xs font-medium text-zinc-700 truncate hidden sm:inline">Petugas</span>
             </div>
-            <div class="h-px w-4 bg-zinc-200 shrink-0" aria-hidden="true"></div>
-            <div id="step2Indicator" class="flex-1 flex items-center gap-2 min-w-0">
-                <span id="step2Dot" class="shrink-0 flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold border-2 border-zinc-200 bg-white text-zinc-400">2</span>
-                <span class="text-xs font-medium text-zinc-400 truncate hidden sm:inline">Product</span>
+            <div class="h-px w-2 sm:w-4 bg-zinc-200 shrink-0" aria-hidden="true"></div>
+            <div id="step2Indicator" class="flex-1 flex items-center gap-1 min-w-0">
+                <span id="step2Dot" class="shrink-0 flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-full text-xs font-bold border-2 border-zinc-200 bg-white text-zinc-400">2</span>
+                <span class="text-[10px] sm:text-xs font-medium text-zinc-400 truncate hidden sm:inline">Lokasi</span>
             </div>
-            <div class="h-px w-4 bg-zinc-200 shrink-0" aria-hidden="true"></div>
-            <div id="step3Indicator" class="flex-1 flex items-center gap-2 min-w-0">
-                <span id="step3Dot" class="shrink-0 flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold border-2 border-zinc-200 bg-white text-zinc-400">3</span>
-                <span class="text-xs font-medium text-zinc-400 truncate hidden sm:inline">Count</span>
+            <div class="h-px w-2 sm:w-4 bg-zinc-200 shrink-0" aria-hidden="true"></div>
+            <div id="step3Indicator" class="flex-1 flex items-center gap-1 min-w-0">
+                <span id="step3Dot" class="shrink-0 flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-full text-xs font-bold border-2 border-zinc-200 bg-white text-zinc-400">3</span>
+                <span class="text-[10px] sm:text-xs font-medium text-zinc-400 truncate hidden sm:inline">Produk</span>
+            </div>
+            <div class="h-px w-2 sm:w-4 bg-zinc-200 shrink-0" aria-hidden="true"></div>
+            <div id="step4Indicator" class="flex-1 flex items-center gap-1 min-w-0">
+                <span id="step4Dot" class="shrink-0 flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-full text-xs font-bold border-2 border-zinc-200 bg-white text-zinc-400">4</span>
+                <span class="text-[10px] sm:text-xs font-medium text-zinc-400 truncate hidden sm:inline">Jumlah</span>
             </div>
         </nav>
 
         <!-- Mobile tabs -->
         <div class="lg:hidden flex rounded-lg bg-zinc-100 p-1 mb-4" role="tablist">
             <button id="tabCount" type="button" onclick="switchTab('count')" role="tab" aria-selected="true" class="flex-1 py-2 text-sm font-semibold rounded-md bg-white text-zinc-900 shadow-sm transition">Count</button>
-            <button id="tabHistory" type="button" onclick="switchTab('history')" role="tab" aria-selected="false" class="flex-1 py-2 text-sm font-semibold rounded-md text-zinc-500 transition">History</button>
+            <button id="tabHistory" type="button" onclick="switchTab('history')" role="tab" aria-selected="false" class="flex-1 py-2 text-sm font-semibold rounded-md text-zinc-500 transition">Riwayat</button>
         </div>
 
         <div class="lg:grid lg:grid-cols-2 lg:gap-6 lg:items-start">
 
             <!-- Count panel -->
-            <div id="panelCount" class="space-y-4">
+            <div id="panelCount" class="space-y-4 relative z-0">
 
-                <!-- Step 2: Product -->
-                <section id="step2Card" class="bg-white rounded-xl border border-zinc-200 shadow-sm overflow-hidden opacity-60 pointer-events-none transition" aria-disabled="true">
-                    <div class="flex items-center gap-3 px-4 py-3 border-b border-zinc-100 bg-zinc-50/80">
-                        <span class="text-xs font-semibold text-zinc-400 bg-zinc-100 px-2 py-0.5 rounded">Step 2</span>
-                        <h2 class="text-sm font-semibold text-zinc-500">Product</h2>
+                <!-- Step 1: Petugas -->
+                <section id="step1Card" class="step-card step-card--active relative z-50">
+                    <div class="step-card__head step-card__head--active">
+                        <span class="step-card__badge step-card__badge--active">Step 1</span>
+                        <h2 class="step-card__title step-card__title--active">Petugas</h2>
+                    </div>
+                    <div class="p-4">
+                        <label for="counterName" class="block text-sm font-medium text-zinc-700 mb-1.5">Nama petugas</label>
+                        <div class="flex gap-2">
+                            <input type="text" id="counterName" name="counterName" autocomplete="off" inputmode="text" placeholder="Ketik nama atau scan ID badge" class="opname-field flex-1 min-w-0 border border-amber-200 p-3 rounded-lg bg-amber-50 text-amber-900 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                            <button type="button" id="scanCounterBtn" class="shrink-0 px-4 py-3 rounded-lg bg-violet-600 hover:bg-violet-700 active:bg-violet-800 text-white text-sm font-semibold disabled:opacity-40">Scan</button>
+                        </div>
+                        <p class="text-xs text-zinc-500 mt-2">Scan QR pada ID badge, atau ketik nama persis seperti di sheet COUNTERS.</p>
+                    </div>
+                </section>
+
+                <!-- Step 2: Lokasi -->
+                <section id="step2Card" class="step-card step-locked" aria-disabled="true">
+                    <div id="step2CardHead" class="step-card__head step-card__head--idle">
+                        <span class="step-card__badge step-card__badge--idle">Step 2</span>
+                        <h2 class="step-card__title step-card__title--idle">Lokasi</h2>
+                    </div>
+                    <div class="p-4">
+                        <label for="location" class="block text-sm font-medium text-zinc-700 mb-1.5">Kode lokasi</label>
+                        <div class="flex gap-2">
+                            <input type="text" id="location" readonly tabindex="-1" placeholder="Belum di-scan" aria-describedby="locationHint" class="opname-field flex-1 min-w-0 border border-amber-200 p-3 rounded-lg bg-amber-50 text-amber-900">
+                            <button type="button" id="scanLocationBtn" disabled class="shrink-0 px-4 py-3 rounded-lg bg-violet-600 hover:bg-violet-700 active:bg-violet-800 text-white text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed">Scan</button>
+                        </div>
+                        <p id="locationHint" class="text-xs text-zinc-500 mt-2">Isi petugas dulu, lalu scan QR lokasi.</p>
+                    </div>
+                </section>
+
+                <!-- Step 3: Produk -->
+                <section id="step3Card" class="step-card step-locked" aria-disabled="true">
+                    <div id="step3CardHead" class="step-card__head step-card__head--idle">
+                        <span class="step-card__badge step-card__badge--idle">Step 3</span>
+                        <h2 class="step-card__title step-card__title--idle">Produk</h2>
                     </div>
                     <div class="p-4 space-y-3">
-                        <button type="button" id="scanSkuBtn" onclick="openScanModal('sku')" disabled class="w-full py-3 px-4 rounded-lg border-2 border-zinc-200 text-zinc-400 font-semibold text-sm transition disabled:opacity-50 disabled:cursor-not-allowed enabled:border-violet-600 enabled:text-violet-700 enabled:hover:bg-violet-50">
-                            Scan SKU QR
+                        <button type="button" id="scanSkuBtn" onclick="openScanModal('sku')" disabled class="w-full py-3 px-4 rounded-lg border-2 border-zinc-200 text-zinc-500 font-semibold text-sm transition disabled:opacity-50 disabled:cursor-not-allowed enabled:border-violet-300 enabled:text-violet-700 enabled:bg-violet-50 enabled:hover:bg-violet-100">
+                            Scan SKU
                         </button>
                         <div>
-                            <label for="skuType" class="block text-sm font-medium text-zinc-600 mb-1">Goods type</label>
-                            <select id="skuType" onchange="updateCategories()" disabled class="w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 font-medium transition">
-                                <option value="">Locked — scan location first</option>
+                            <label for="skuType" class="block text-sm font-medium text-zinc-700 mb-1">Jenis barang</label>
+                            <select id="skuType" onchange="updateCategories()" disabled class="w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 text-sm font-medium focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                                <option value="">Scan lokasi dulu</option>
                             </select>
                         </div>
                         <div>
-                            <label for="skuCategory" class="block text-sm font-medium text-zinc-600 mb-1">Category</label>
-                            <select id="skuCategory" onchange="updateSkus()" disabled class="w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 font-medium transition">
-                                <option value="">Locked</option>
+                            <label for="skuCategory" class="block text-sm font-medium text-zinc-700 mb-1">Kategori</label>
+                            <select id="skuCategory" onchange="updateSkus()" disabled class="w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 text-sm font-medium focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                                <option value="">Pilih jenis dulu</option>
                             </select>
                         </div>
                         <div>
-                            <label for="skuSelector" class="block text-sm font-medium text-zinc-600 mb-1">SKU code</label>
-                            <select id="skuSelector" onchange="updateStepperUI(); updateSubmitState();" disabled class="w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 font-medium transition">
-                                <option value="">Locked</option>
+                            <label for="skuSelector" class="block text-sm font-medium text-zinc-700 mb-1">Kode SKU</label>
+                            <select id="skuSelector" onchange="updateStepperUI(); updateSubmitState();" disabled class="w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 text-sm font-medium focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                                <option value="">Pilih kategori dulu</option>
                             </select>
                         </div>
                     </div>
                 </section>
 
-                <!-- Step 3: Count -->
-                <section id="step3Card" class="bg-white rounded-xl border border-zinc-200 shadow-sm overflow-hidden opacity-60 pointer-events-none transition" aria-disabled="true">
-                    <div class="flex items-center gap-3 px-4 py-3 border-b border-zinc-100 bg-zinc-50/80">
-                        <span class="text-xs font-semibold text-zinc-400 bg-zinc-100 px-2 py-0.5 rounded">Step 3</span>
-                        <h2 class="text-sm font-semibold text-zinc-500">Quantity</h2>
+                <!-- Step 4: Jumlah -->
+                <section id="step4Card" class="step-card step-locked" aria-disabled="true">
+                    <div id="step4CardHead" class="step-card__head step-card__head--idle">
+                        <span class="step-card__badge step-card__badge--idle">Step 4</span>
+                        <h2 class="step-card__title step-card__title--idle">Jumlah</h2>
                     </div>
                     <div class="p-4 space-y-4">
-                        <div class="flex items-center justify-center gap-3">
-                            <button type="button" onclick="adjustCount(-10)" class="text-xs font-semibold text-zinc-500 bg-zinc-100 hover:bg-zinc-200 px-3 py-2 rounded-lg transition">−10</button>
-                            <button type="button" onclick="adjustCount(-1)" class="flex h-12 w-12 items-center justify-center rounded-full bg-zinc-100 hover:bg-zinc-200 text-xl font-bold text-zinc-700 transition">−</button>
-                            <input type="number" id="count" oninput="updateSubmitState()" onfocus="this.select()" onclick="this.select()" class="w-28 border border-zinc-200 rounded-xl text-center text-4xl font-bold tabular-nums text-zinc-900 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none" value="0" min="0">
-                            <button type="button" onclick="adjustCount(1)" class="flex h-12 w-12 items-center justify-center rounded-full bg-violet-600 hover:bg-violet-700 text-xl font-bold text-white transition">+</button>
-                            <button type="button" onclick="adjustCount(10)" class="text-xs font-semibold text-zinc-500 bg-zinc-100 hover:bg-zinc-200 px-3 py-2 rounded-lg transition">+10</button>
+                        <div class="flex items-center justify-center gap-2 sm:gap-3">
+                            <button type="button" onclick="adjustCount(-10)" class="text-xs font-semibold text-zinc-600 bg-zinc-100 hover:bg-zinc-200 px-2.5 py-2 rounded-lg">−10</button>
+                            <button type="button" onclick="adjustCount(-1)" class="flex h-11 w-11 sm:h-12 sm:w-12 items-center justify-center rounded-full bg-zinc-100 hover:bg-zinc-200 text-xl font-bold text-zinc-800">−</button>
+                            <input type="number" id="count" oninput="updateSubmitState()" onfocus="this.select()" onclick="this.select()" class="w-24 sm:w-28 border border-zinc-200 rounded-xl text-center text-3xl sm:text-4xl font-bold tabular-nums text-zinc-900 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none" value="0" min="0">
+                            <button type="button" onclick="adjustCount(1)" class="flex h-11 w-11 sm:h-12 sm:w-12 items-center justify-center rounded-full bg-violet-600 hover:bg-violet-700 text-xl font-bold text-white">+</button>
+                            <button type="button" onclick="adjustCount(10)" class="text-xs font-semibold text-zinc-600 bg-zinc-100 hover:bg-zinc-200 px-2.5 py-2 rounded-lg">+10</button>
                         </div>
                         <div>
-                            <label for="notes" class="block text-sm font-medium text-zinc-600 mb-1">Notes <span class="text-zinc-400 font-normal">(optional)</span></label>
-                            <input type="text" id="notes" class="w-full border border-zinc-200 p-3 rounded-lg text-sm focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none transition" placeholder="e.g. damaged box">
+                            <label for="notes" class="block text-sm font-medium text-zinc-700 mb-1">Catatan <span class="text-zinc-400 font-normal">(opsional)</span></label>
+                            <input type="text" id="notes" class="w-full border border-zinc-200 p-3 rounded-lg text-sm text-zinc-900 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none" placeholder="Contoh: kemasan rusak">
                         </div>
                     </div>
                 </section>
-
-                <div id="footerSubmit" class="fixed bottom-0 left-0 right-0 z-30 bg-white/95 backdrop-blur-md border-t border-zinc-200 p-4 pb-[max(1rem,env(safe-area-inset-bottom))] lg:relative lg:z-auto lg:border-0 lg:bg-transparent lg:p-0 lg:mt-2 lg:pb-0">
-                    <button id="submitBtn" type="button" onclick="submitData()" disabled class="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-zinc-300 disabled:cursor-not-allowed text-white font-semibold text-base py-3.5 rounded-xl shadow-sm active:scale-[0.98] transition flex items-center justify-center gap-2">
-                        <span id="submitBtnLabel">Submit to master sheet</span>
-                        <svg id="submitSpinner" class="hidden h-5 w-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
-                    </button>
-                </div>
             </div>
 
             <!-- History panel -->
             <div id="panelHistory" class="hidden lg:block">
-                <div class="bg-white rounded-xl border border-zinc-200 shadow-sm p-4 space-y-3 lg:sticky lg:top-52">
-                    <div class="flex justify-between items-center">
-                        <h2 class="text-sm font-semibold text-zinc-800">Recent activity</h2>
-                        <button type="button" onclick="fetchHistory()" class="text-sm font-medium text-violet-600 hover:text-violet-800">Refresh</button>
+                <div class="step-card lg:sticky lg:top-4">
+                    <div class="step-card__head step-card__head--idle">
+                        <h2 class="step-card__title step-card__title--idle flex-1">Riwayat</h2>
+                        <button type="button" onclick="fetchHistory()" class="text-sm font-semibold text-violet-600 hover:text-violet-800">Refresh</button>
                     </div>
-                    <div id="historyContainer" class="space-y-2 max-h-[calc(100vh-10rem)] overflow-y-auto text-sm">
-                        <p class="text-zinc-400 text-center py-8">Loading history…</p>
+                    <div id="historyContainer" class="p-4 pt-2 space-y-2 max-h-[calc(100vh-12rem)] overflow-y-auto text-sm">
+                        <p class="text-zinc-400 text-center py-8">Memuat riwayat…</p>
                     </div>
                 </div>
             </div>
         </div>
     </main>
 
-    <!-- Scanner modal -->
-    <div id="scanModal" class="fixed inset-0 z-50 hidden" role="dialog" aria-modal="true" aria-labelledby="scanModalTitle">
-        <div class="absolute inset-0 bg-black/70" onclick="closeScanModal()"></div>
+    <div id="footerSubmit" class="fixed bottom-0 left-0 right-0 z-20 bg-white/95 backdrop-blur-md border-t border-zinc-200 p-4 pb-[max(1rem,env(safe-area-inset-bottom))] lg:max-w-5xl lg:mx-auto lg:left-0 lg:right-0">
+        <button id="submitBtn" type="button" onclick="submitData()" disabled class="w-full max-w-md mx-auto block bg-emerald-600 hover:bg-emerald-700 disabled:bg-zinc-300 disabled:cursor-not-allowed text-white font-semibold text-base py-3.5 rounded-xl shadow-sm active:scale-[0.98] transition flex items-center justify-center gap-2">
+                        <span id="submitBtnLabel">Kirim ke sheet</span>
+            <svg id="submitSpinner" class="hidden h-5 w-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
+        </button>
+    </div>
+
+    <!-- Scanner modal (native hidden until opened — do not rely on Tailwind "hidden" alone) -->
+    <div id="scanModal" hidden class="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-labelledby="scanModalTitle">
+        <div class="absolute inset-0 bg-black/70" id="scanModalBackdrop"></div>
         <div class="absolute inset-x-0 bottom-0 max-h-[92vh] flex flex-col bg-white rounded-t-2xl shadow-2xl lg:inset-auto lg:top-1/2 lg:left-1/2 lg:-translate-x-1/2 lg:-translate-y-1/2 lg:w-full lg:max-w-lg lg:rounded-2xl">
             <div class="flex items-center justify-between px-4 py-3 border-b border-zinc-100 shrink-0">
                 <h3 id="scanModalTitle" class="text-base font-semibold text-zinc-900">Scan QR code</h3>
@@ -337,29 +473,49 @@ HTML_TEMPLATE = """
             </div>
             <div class="p-4 overflow-hidden flex-1 min-h-0">
                 <div id="reader" class="w-full aspect-square max-h-[55vh] mx-auto rounded-xl overflow-hidden bg-black"></div>
-                <p class="text-center text-xs text-zinc-500 mt-3">Point your camera at the QR code</p>
+                <p id="scanModalHint" class="text-center text-xs text-zinc-500 mt-3">Arahkan kamera ke QR code</p>
             </div>
         </div>
     </div>
 
+    <script id="app-boot-data" type="application/json">{{ boot_data|tojson }}</script>
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
     <script>
-        const skuTree = {{ sku_tree|tojson|safe }};
-        let locationLookup = {{ location_lookup|tojson|safe }};
-        let counterLookup = {{ counter_lookup|tojson|safe }};
-        let validLocations = new Set({{ valid_locations|tojson|safe }});
-        let validCounters = new Set({{ valid_counters|tojson|safe }});
+        const _boot = (function () {
+            try {
+                return JSON.parse(document.getElementById('app-boot-data').textContent || '{}');
+            } catch (e) {
+                console.error('Boot data parse failed', e);
+                return {};
+            }
+        })();
+        const skuTree = _boot.sku_tree || {};
+        let locationLookup = _boot.location_lookup || {};
+        let counterLookup = _boot.counter_lookup || {};
+        let lookupWarnings = _boot.lookup_warnings || [];
+        let validLocations = new Set(_boot.valid_locations || []);
+        let validCounters = new Set(_boot.valid_counters || []);
         let currentTarget = '';
         let scannerRunning = false;
-        let scanConfirm = { text: '', count: 0, at: 0 };
-        const html5QrcodeScanner = new Html5Qrcode("reader");
+        let lastHandledScan = { key: '', at: 0, target: '' };
+        let html5QrcodeScanner = null;
+        const COUNTER_PREFIXES = [
+            'counter:', 'counter name:', 'name:', 'nama:', 'nama petugas:',
+            'petugas:', 'id:', 'badge:', 'id badge:',
+        ];
+        const LOCATION_PREFIXES = [
+            'loc:', 'location:', 'lokasi:', 'kode lokasi:', 'precise location:',
+        ];
 
+        const FIELD_AMBER = "opname-field flex-1 min-w-0 border border-amber-200 p-3 rounded-lg bg-amber-50 text-amber-900 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none";
+        const FIELD_EMERALD = "opname-field flex-1 min-w-0 border border-emerald-200 p-3 rounded-lg bg-emerald-50 text-emerald-900 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none";
         const CLS = {
-            counterLocked: "flex-1 min-w-0 border border-amber-200 p-2.5 rounded-lg bg-amber-50 text-sm font-semibold text-amber-800 placeholder-amber-400/80 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none",
-            counterUnlocked: "flex-1 min-w-0 border border-emerald-200 p-2.5 rounded-lg bg-emerald-50 text-sm font-semibold text-emerald-800 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none",
-            locLocked: "flex-1 min-w-0 border border-amber-200 p-2.5 rounded-lg bg-amber-50 font-mono text-sm font-semibold text-amber-800 placeholder-amber-400/80",
-            locUnlocked: "flex-1 min-w-0 border border-emerald-200 p-2.5 rounded-lg bg-emerald-50 font-mono text-sm font-semibold text-emerald-800",
-            selLocked: "w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 font-medium transition",
-            selUnlocked: "w-full border border-zinc-200 p-3 rounded-lg bg-white text-zinc-900 font-medium focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none transition",
+            counterLocked: FIELD_AMBER,
+            counterUnlocked: FIELD_EMERALD,
+            locLocked: FIELD_AMBER,
+            locUnlocked: FIELD_EMERALD,
+            selLocked: "w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 text-sm font-medium",
+            selUnlocked: "w-full border border-zinc-200 p-3 rounded-lg bg-white text-zinc-900 text-sm font-medium focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none",
         };
 
         const STEP_DOT = {
@@ -368,11 +524,43 @@ HTML_TEMPLATE = """
             done: "shrink-0 flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold border-2 border-emerald-500 bg-emerald-500 text-white",
         };
 
+        function showLookupWarnings(warnings) {
+            const box = document.getElementById('lookupWarnings');
+            const inner = box.querySelector('div');
+            if (!warnings || !warnings.length) {
+                box.classList.add('hidden');
+                inner.innerHTML = '';
+                return;
+            }
+            inner.innerHTML = '<p class="font-semibold">Periksa sheet master:</p>' +
+                warnings.map(w => `<p>• ${w}</p>`).join('');
+            box.classList.remove('hidden');
+        }
+
         function applyLookupData(data) {
             locationLookup = data.locations || {};
             counterLookup = data.counters || {};
             validLocations = new Set(Object.values(locationLookup));
             validCounters = new Set(Object.values(counterLookup));
+            if (data.warnings) {
+                lookupWarnings = data.warnings;
+                showLookupWarnings(lookupWarnings);
+            }
+        }
+
+        function resolveSku(code) {
+            const trimmed = String(code || '').trim();
+            if (!trimmed) return null;
+            for (const type in skuTree) {
+                for (const cat in skuTree[type]) {
+                    if (skuTree[type][cat].includes(trimmed)) return trimmed;
+                    const key = normalizeScanText(trimmed).toLowerCase();
+                    for (const sku of skuTree[type][cat]) {
+                        if (normalizeScanText(sku).toLowerCase() === key) return sku;
+                    }
+                }
+            }
+            return null;
         }
 
         async function loadLookups() {
@@ -384,12 +572,12 @@ HTML_TEMPLATE = """
             } catch (e) {}
         }
 
-        function resetScanConfirm() {
-            scanConfirm = { text: '', count: 0, at: 0 };
+        function resetScanDebounce() {
+            lastHandledScan = { key: '', at: 0, target: '' };
         }
 
-        function normalizeScanText(code) {
-            let s = String(code || '').trim().replace(/\ufeff/g, '').replace(/\u200b/g, '').replace(/\r/g, '').replace(/\n/g, '');
+        function normalizeScanText(code, kind = 'any') {
+            let s = String(code || '').trim().replace(/\\ufeff/g, '').replace(/\\u200b/g, '').replace(/\\r/g, '').replace(/\\n/g, '');
             if (!s) return '';
             if (/^https?:\/\//i.test(s) || s.includes('://')) {
                 s = s.replace(/\/+$/, '').split('/').pop();
@@ -397,7 +585,9 @@ HTML_TEMPLATE = """
             if (s.includes('?')) s = s.split('?')[0];
             if (s.includes('#')) s = s.split('#')[0];
             s = s.trim();
-            const prefixes = ['loc:', 'location:', 'lokasi:', 'kode lokasi:', 'counter:', 'counter name:', 'name:', 'nama:', 'petugas:', 'id:', 'badge:'];
+            let prefixes = COUNTER_PREFIXES.concat(LOCATION_PREFIXES);
+            if (kind === 'counter') prefixes = COUNTER_PREFIXES;
+            else if (kind === 'location') prefixes = LOCATION_PREFIXES;
             for (const p of prefixes) {
                 if (s.toLowerCase().startsWith(p)) {
                     s = s.slice(p.length).trim();
@@ -407,25 +597,164 @@ HTML_TEMPLATE = """
             return s.trim();
         }
 
-        function isScanConfirmed(raw) {
-            const text = normalizeScanText(raw);
-            if (!text) return false;
-            const now = Date.now();
-            if (scanConfirm.text === text && now - scanConfirm.at < 2500) {
-                scanConfirm.count += 1;
-            } else {
-                scanConfirm = { text, count: 1, at: now };
-            }
-            return scanConfirm.count >= 2;
+        function scanKindForTarget(target) {
+            if (target === 'counter') return 'counter';
+            if (target === 'location') return 'location';
+            return 'any';
         }
 
-        window.onload = async () => {
-            await loadLookups();
-            lockAfterCounter();
+        function shouldHandleScan(raw, target) {
+            const kind = scanKindForTarget(target || currentTarget);
+            const key = normalizeScanText(raw, kind).toLowerCase();
+            if (!key) return false;
+            const now = Date.now();
+            if (lastHandledScan.key === key && lastHandledScan.target === target && now - lastHandledScan.at < 500) {
+                return false;
+            }
+            return true;
+        }
+
+        function markScanHandled(raw, target) {
+            const kind = scanKindForTarget(target || currentTarget);
+            const key = normalizeScanText(raw, kind).toLowerCase();
+            if (key) lastHandledScan = { key, at: Date.now(), target: target || currentTarget };
+        }
+
+        function updateLocationUI() {
+            const locInput = document.getElementById('location');
+            const hint = document.getElementById('locationHint');
+            const counterOk = isValidCounter(document.getElementById('counterName').value);
+            if (!counterOk) {
+                if (hint) hint.textContent = 'Isi nama petugas dulu (scan badge atau ketik).';
+                locInput.placeholder = 'Belum di-scan';
+            } else if (locInput.value.trim()) {
+                if (hint) hint.textContent = 'Lokasi terisi. Tekan Scan untuk mengganti.';
+                locInput.placeholder = locInput.value;
+            } else {
+                if (hint) hint.textContent = 'Tekan Scan untuk QR lokasi.';
+                locInput.placeholder = 'Belum di-scan';
+            }
+        }
+
+        function lockSkuFields() {
+            document.getElementById('scanSkuBtn').disabled = true;
+            ['skuType', 'skuCategory', 'skuSelector'].forEach(id => {
+                const el = document.getElementById(id);
+                el.disabled = true;
+                el.innerHTML = id === 'skuType'
+                    ? '<option value="">Scan lokasi dulu</option>'
+                    : id === 'skuCategory'
+                    ? '<option value="">Pilih jenis dulu</option>'
+                    : '<option value="">Pilih kategori dulu</option>';
+                el.className = CLS.selLocked;
+            });
+        }
+
+        function resetLocationAndSku() {
+            const locInput = document.getElementById('location');
+            locInput.value = '';
+            locInput.className = CLS.locLocked;
+            updateLocationUI();
+            lockSkuFields();
             updateStepperUI();
             updateSubmitState();
+        }
+
+        async function syncUIState() {
+            const counterInput = document.getElementById('counterName');
+            const locInput = document.getElementById('location');
+            const historyContainer = document.getElementById('historyContainer');
+
+            if (isValidCounter(counterInput.value)) {
+                counterInput.className = CLS.counterUnlocked;
+                counterInput.removeAttribute('readonly');
+                document.getElementById('scanLocationBtn').disabled = false;
+                setStepCardEnabled('step2Card', true);
+                updateLocationUI();
+                if (locInput.value.trim() && isValidLocation(locInput.value)) {
+                    unlockFormForLocation();
+                } else {
+                    if (locInput.value.trim() && !isValidLocation(locInput.value)) {
+                        locInput.value = '';
+                    }
+                    lockSkuFields();
+                    locInput.className = CLS.locLocked;
+                }
+                fetchHistory();
+            } else {
+                counterInput.className = CLS.counterLocked;
+                counterInput.removeAttribute('readonly');
+                document.getElementById('scanLocationBtn').disabled = true;
+                setStepCardEnabled('step2Card', false);
+                locInput.value = '';
+                locInput.className = CLS.locLocked;
+                updateLocationUI();
+                lockSkuFields();
+                historyContainer.innerHTML = '<p class="text-zinc-400 text-center py-8">Scan badge atau ketik nama petugas.</p>';
+            }
+            updateStepperUI();
+            updateSubmitState();
+        }
+
+        function getScanner() {
+            if (!html5QrcodeScanner && typeof Html5Qrcode !== 'undefined') {
+                html5QrcodeScanner = new Html5Qrcode('reader');
+            }
+            return html5QrcodeScanner;
+        }
+
+        function bindScanButtons() {
+            const counterBtn = document.getElementById('scanCounterBtn');
+            const locationBtn = document.getElementById('scanLocationBtn');
+            const counterInput = document.getElementById('counterName');
+            if (counterBtn) {
+                counterBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    openScanModal('counter');
+                });
+            }
+            if (locationBtn) {
+                locationBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    openScanModal('location');
+                });
+            }
+            if (counterInput) {
+                counterInput.addEventListener('input', onCounterNameInput);
+                counterInput.addEventListener('blur', onCounterNameInput);
+            }
+            const backdrop = document.getElementById('scanModalBackdrop');
+            if (backdrop) {
+                backdrop.addEventListener('click', () => closeScanModal());
+            }
+        }
+
+        function resetPageInteractionState() {
+            document.body.style.overflow = '';
+            document.body.style.pointerEvents = '';
+            const modal = document.getElementById('scanModal');
+            if (!modal) return;
+            modal.hidden = true;
+            modal.classList.remove('is-open');
+            modal.style.display = 'none';
+        }
+
+        async function initApp() {
+            resetPageInteractionState();
+            bindScanButtons();
+            showLookupWarnings(lookupWarnings);
+            await loadLookups();
+            await syncUIState();
             switchTab('count');
-        };
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => { initApp().catch(console.error); });
+        } else {
+            initApp().catch(console.error);
+        }
 
         function switchTab(tab) {
             const isLg = window.matchMedia('(min-width: 1024px)').matches;
@@ -459,11 +788,34 @@ HTML_TEMPLATE = """
 
         window.addEventListener('resize', () => switchTab(document.getElementById('tabHistory').getAttribute('aria-selected') === 'true' ? 'history' : 'count'));
 
-        function setStepCardEnabled(cardId, enabled) {
+        function setStepCardVisual(cardId, active) {
             const card = document.getElementById(cardId);
-            card.classList.toggle('opacity-60', !enabled);
-            card.classList.toggle('pointer-events-none', !enabled);
-            card.setAttribute('aria-disabled', !enabled);
+            const head = document.getElementById(cardId + 'Head');
+            if (!card) return;
+            card.classList.toggle('step-card--active', active);
+            if (head) {
+                head.classList.toggle('step-card__head--active', active);
+                head.classList.toggle('step-card__head--idle', !active);
+                const badge = head.querySelector('.step-card__badge');
+                const title = head.querySelector('.step-card__title');
+                if (badge) {
+                    badge.classList.toggle('step-card__badge--active', active);
+                    badge.classList.toggle('step-card__badge--idle', !active);
+                }
+                if (title) {
+                    title.classList.toggle('step-card__title--active', active);
+                    title.classList.toggle('step-card__title--idle', !active);
+                }
+            }
+        }
+
+        function setStepCardEnabled(cardId, enabled) {
+            if (cardId === 'step1Card') return;
+            const card = document.getElementById(cardId);
+            if (!card) return;
+            card.classList.toggle('step-locked', !enabled);
+            card.setAttribute('aria-disabled', String(!enabled));
+            setStepCardVisual(cardId, enabled);
         }
 
         function setStepDot(num, state) {
@@ -481,40 +833,46 @@ HTML_TEMPLATE = """
             const loc = document.getElementById('location').value.trim();
             const sku = document.getElementById('skuSelector').value;
 
+            setStepCardEnabled('step2Card', counterOk);
+
             if (!counterOk) {
-                setStepDot(1, 'pending');
+                setStepDot(1, 'active');
                 setStepDot(2, 'pending');
                 setStepDot(3, 'pending');
-                setStepCardEnabled('step2Card', false);
+                setStepDot(4, 'pending');
                 setStepCardEnabled('step3Card', false);
+                setStepCardEnabled('step4Card', false);
                 return;
             }
 
             if (!loc) {
-                setStepDot(1, 'active');
-                setStepDot(2, 'pending');
-                setStepDot(3, 'pending');
-                setStepCardEnabled('step2Card', false);
-                setStepCardEnabled('step3Card', false);
-            } else if (!sku) {
                 setStepDot(1, 'done');
                 setStepDot(2, 'active');
                 setStepDot(3, 'pending');
-                setStepCardEnabled('step2Card', true);
+                setStepDot(4, 'pending');
                 setStepCardEnabled('step3Card', false);
-            } else {
+                setStepCardEnabled('step4Card', false);
+            } else if (!sku) {
                 setStepDot(1, 'done');
                 setStepDot(2, 'done');
                 setStepDot(3, 'active');
-                setStepCardEnabled('step2Card', true);
+                setStepDot(4, 'pending');
                 setStepCardEnabled('step3Card', true);
+                setStepCardEnabled('step4Card', false);
+            } else {
+                setStepDot(1, 'done');
+                setStepDot(2, 'done');
+                setStepDot(3, 'done');
+                setStepDot(4, 'active');
+                setStepCardEnabled('step3Card', true);
+                setStepCardEnabled('step4Card', true);
             }
         }
 
         function updateSubmitState() {
             const ready = isValidCounter(document.getElementById('counterName').value)
-                && document.getElementById('location').value.trim()
-                && document.getElementById('skuSelector').value
+                && resolveLocation(document.getElementById('location').value)
+                && resolveSku(document.getElementById('skuSelector').value)
                 && document.getElementById('count').value !== '';
             const btn = document.getElementById('submitBtn');
             btn.disabled = !ready || btn.dataset.loading === '1';
@@ -524,7 +882,7 @@ HTML_TEMPLATE = """
             const trimmed = String(name || '').trim();
             if (!trimmed) return null;
             if (validCounters.has(trimmed)) return trimmed;
-            const key = normalizeScanText(trimmed).toLowerCase();
+            const key = normalizeScanText(trimmed, 'counter').toLowerCase();
             return counterLookup[key] || null;
         }
 
@@ -532,56 +890,37 @@ HTML_TEMPLATE = """
             return !!resolveCounter(name);
         }
 
-        function applyCounterScan(text) {
+        async function applyCounterScan(text) {
+            if (!Object.keys(counterLookup).length) {
+                await loadLookups();
+            }
             if (!Object.keys(counterLookup).length) {
                 showToast('Daftar petugas belum dimuat. Hubungi admin.', 'error');
                 return false;
             }
             const resolved = resolveCounter(text);
             if (!resolved) {
-                const scanned = normalizeScanText(text) || String(text).trim();
+                const scanned = normalizeScanText(text, 'counter') || String(text).trim();
                 showToast(`Petugas tidak dikenali: "${scanned.slice(0, 40)}". Periksa tab COUNTERS.`, 'warning');
                 return false;
             }
             document.getElementById('counterName').value = resolved;
             unlockAfterCounter();
+            await syncUIState();
             return true;
         }
 
         function onCounterNameInput() {
-            if (isValidCounter(document.getElementById('counterName').value)) {
-                unlockAfterCounter();
-            } else {
-                lockAfterCounter();
-            }
+            syncUIState();
         }
 
         function unlockAfterCounter() {
-            const counterInput = document.getElementById('counterName');
-            counterInput.className = CLS.counterUnlocked;
+            document.getElementById('counterName').className = CLS.counterUnlocked;
             document.getElementById('scanLocationBtn').disabled = false;
-            const locInput = document.getElementById('location');
-            if (!locInput.value.trim()) {
-                locInput.placeholder = 'Scan lokasi';
-            }
+            updateLocationUI();
             updateStepperUI();
             updateSubmitState();
             fetchHistory();
-        }
-
-        function lockAfterCounter() {
-            const counterInput = document.getElementById('counterName');
-            if (!isValidCounter(counterInput.value)) {
-                counterInput.className = CLS.counterLocked;
-            }
-            document.getElementById('scanLocationBtn').disabled = true;
-            const locInput = document.getElementById('location');
-            locInput.placeholder = 'Scan ID badge dulu';
-            lockFormPostSubmit();
-            updateStepperUI();
-            updateSubmitState();
-            const container = document.getElementById('historyContainer');
-            container.innerHTML = '<p class="text-zinc-400 text-center py-8">Scan ID badge atau ketik nama petugas.</p>';
         }
 
         let toastTimer;
@@ -595,10 +934,10 @@ HTML_TEMPLATE = """
             };
             inner.className = `rounded-xl px-4 py-3 text-sm font-medium shadow-lg border ${styles[type] || styles.success}`;
             inner.textContent = message;
-            toast.classList.remove('translate-y-[-120%]', 'opacity-0', 'pointer-events-none');
+            toast.classList.remove('translate-y-[-120%]', 'opacity-0');
             clearTimeout(toastTimer);
             toastTimer = setTimeout(() => {
-                toast.classList.add('translate-y-[-120%]', 'opacity-0', 'pointer-events-none');
+                toast.classList.add('translate-y-[-120%]', 'opacity-0');
             }, type === 'warning' ? 6000 : 3500);
         }
 
@@ -606,7 +945,7 @@ HTML_TEMPLATE = """
             const trimmed = String(code || '').trim();
             if (!trimmed) return null;
             if (validLocations.has(trimmed)) return trimmed;
-            const key = normalizeScanText(trimmed).toLowerCase();
+            const key = normalizeScanText(trimmed, 'location').toLowerCase();
             return locationLookup[key] || null;
         }
 
@@ -616,7 +955,7 @@ HTML_TEMPLATE = """
 
         function applyLocationScan(text) {
             if (!isValidCounter(document.getElementById('counterName').value)) {
-                showToast('Scan ID badge petugas dulu.', 'warning');
+                showToast('Scan kode QR lokasi', 'warning');
                 return false;
             }
             if (!Object.keys(locationLookup).length) {
@@ -625,7 +964,7 @@ HTML_TEMPLATE = """
             }
             const resolved = resolveLocation(text);
             if (!resolved) {
-                const scanned = normalizeScanText(text) || String(text).trim();
+                const scanned = normalizeScanText(text, 'location') || String(text).trim();
                 showToast(`Lokasi tidak dikenali: "${scanned.slice(0, 40)}". Periksa tab LOCATIONS.`, 'warning');
                 return false;
             }
@@ -637,13 +976,14 @@ HTML_TEMPLATE = """
         function unlockFormForLocation() {
             const locInput = document.getElementById('location');
             locInput.className = CLS.locUnlocked;
+            updateLocationUI();
 
             document.getElementById('scanSkuBtn').disabled = false;
 
             const typeSelect = document.getElementById('skuType');
             typeSelect.disabled = false;
             typeSelect.className = CLS.selUnlocked;
-            typeSelect.innerHTML = '<option value="">Choose goods type</option>';
+            typeSelect.innerHTML = '<option value="">Pilih jenis barang</option>';
             Object.keys(skuTree).sort().forEach(type => {
                 typeSelect.options[typeSelect.options.length] = new Option(type, type);
             });
@@ -652,34 +992,14 @@ HTML_TEMPLATE = """
             updateSubmitState();
         }
 
-        function lockFormPostSubmit() {
-            const locInput = document.getElementById('location');
-            locInput.value = '';
-            locInput.className = CLS.locLocked;
-            locInput.placeholder = 'Scan lokasi';
-
-            document.getElementById('scanSkuBtn').disabled = true;
-
-            ['skuType', 'skuCategory', 'skuSelector'].forEach(id => {
-                const el = document.getElementById(id);
-                el.disabled = true;
-                el.innerHTML = id === 'skuType'
-                    ? '<option value="">Locked — scan location first</option>'
-                    : '<option value="">Locked</option>';
-                el.className = CLS.selLocked;
-            });
-
-            updateStepperUI();
-            updateSubmitState();
-        }
 
         function updateCategories() {
             const typeVal = document.getElementById('skuType').value;
             const catSelect = document.getElementById('skuCategory');
             const skuSelect = document.getElementById('skuSelector');
 
-            catSelect.innerHTML = '<option value="">Choose category</option>';
-            skuSelect.innerHTML = '<option value="">Choose SKU</option>';
+            catSelect.innerHTML = '<option value="">Pilih kategori</option>';
+            skuSelect.innerHTML = '<option value="">Pilih SKU</option>';
             skuSelect.disabled = true;
             skuSelect.className = CLS.selLocked;
 
@@ -705,7 +1025,7 @@ HTML_TEMPLATE = """
             const catVal = document.getElementById('skuCategory').value;
             const skuSelect = document.getElementById('skuSelector');
 
-            skuSelect.innerHTML = '<option value="">Choose SKU</option>';
+            skuSelect.innerHTML = '<option value="">Pilih SKU</option>';
 
             if (!catVal || !skuTree[typeVal] || !skuTree[typeVal][catVal]) {
                 skuSelect.disabled = true;
@@ -724,36 +1044,68 @@ HTML_TEMPLATE = """
             updateSubmitState();
         }
 
+        async function ensureScannerStopped() {
+            const scanner = getScanner();
+            if (!scanner) return;
+            try {
+                await scanner.stop();
+            } catch (e) {}
+            try {
+                scanner.clear();
+            } catch (e) {}
+            scannerRunning = false;
+        }
+
         async function openScanModal(target) {
             if (target === 'location' && document.getElementById('scanLocationBtn').disabled) return;
             if (target === 'sku' && document.getElementById('scanSkuBtn').disabled) return;
+            if (typeof Html5Qrcode === 'undefined') {
+                showToast('Pemindai QR tidak termuat. Muat ulang halaman.', 'error');
+                return;
+            }
 
             currentTarget = target;
             const scanTitles = {
                 counter: 'Scan ID badge',
-                location: 'Scan location QR',
-                sku: 'Scan SKU QR',
+                location: 'Scan lokasi',
+                sku: 'Scan SKU',
+            };
+            const scanHints = {
+                counter: 'Arahkan kamera ke QR pada ID badge petugas',
+                location: 'Arahkan kamera ke QR lokasi',
+                sku: 'Arahkan kamera ke QR SKU',
             };
             document.getElementById('scanModalTitle').textContent = scanTitles[target] || 'Scan QR';
-            document.getElementById('scanModal').classList.remove('hidden');
-            document.body.classList.add('overflow-hidden');
-            resetScanConfirm();
+            document.getElementById('scanModalHint').textContent = scanHints[target] || 'Arahkan kamera ke QR code';
+            const modal = document.getElementById('scanModal');
+            modal.hidden = false;
+            modal.classList.add('is-open');
+            modal.style.display = 'block';
+            document.body.style.overflow = 'hidden';
+            resetScanDebounce();
 
-            await new Promise(r => setTimeout(r, 150));
+            await ensureScannerStopped();
+            await new Promise(r => setTimeout(r, 200));
 
-            if (scannerRunning) return;
+            const scanner = getScanner();
+            if (!scanner) {
+                showToast('Pemindai QR tidak siap. Muat ulang halaman.', 'error');
+                closeScanModal();
+                return;
+            }
+
             try {
                 scannerRunning = true;
-                await html5QrcodeScanner.start(
+                await scanner.start(
                     { facingMode: "environment" },
                     { fps: 15, qrbox: { width: 250, height: 250 } },
                     async (decodedText) => {
                         const text = decodedText.trim();
-                        if (!isScanConfirmed(text)) return;
+                        if (!text || !shouldHandleScan(text, currentTarget)) return;
 
                         let shouldClose = false;
                         if (currentTarget === 'counter') {
-                            shouldClose = applyCounterScan(text);
+                            shouldClose = await applyCounterScan(text);
                         } else if (currentTarget === 'location') {
                             shouldClose = applyLocationScan(text);
                         } else if (currentTarget === 'sku') {
@@ -774,14 +1126,21 @@ HTML_TEMPLATE = """
                                 if (found) break;
                             }
                             if (!found) {
-                                showToast('SKU not found: ' + skuText, 'warning');
+                                showToast('SKU tidak dikenali: ' + skuText, 'warning');
                             } else {
+                                const resolved = resolveSku(document.getElementById('skuSelector').value);
+                                if (resolved) {
+                                    document.getElementById('skuSelector').value = resolved;
+                                }
                                 updateStepperUI();
                                 updateSubmitState();
                                 shouldClose = true;
                             }
                         }
-                        if (shouldClose) await closeScanModal();
+                        if (shouldClose) {
+                            markScanHandled(text, currentTarget);
+                            await closeScanModal();
+                        }
                     },
                     () => {}
                 );
@@ -793,15 +1152,23 @@ HTML_TEMPLATE = """
         }
 
         async function closeScanModal() {
-            try {
-                if (scannerRunning && html5QrcodeScanner.isScanning) {
-                    await html5QrcodeScanner.stop();
-                }
-            } catch (e) {}
-            scannerRunning = false;
-            document.getElementById('scanModal').classList.add('hidden');
-            document.body.classList.remove('overflow-hidden');
+            await ensureScannerStopped();
+            const modal = document.getElementById('scanModal');
+            modal.hidden = true;
+            modal.classList.remove('is-open');
+            modal.style.display = 'none';
+            document.body.style.overflow = '';
         }
+
+        window.openScanModal = openScanModal;
+        window.closeScanModal = closeScanModal;
+        window.onCounterNameInput = onCounterNameInput;
+        window.switchTab = switchTab;
+        window.submitData = submitData;
+        window.fetchHistory = fetchHistory;
+        window.updateCategories = updateCategories;
+        window.updateSkus = updateSkus;
+        window.adjustCount = adjustCount;
 
         function adjustCount(amount) {
             const countInput = document.getElementById('count');
@@ -821,15 +1188,15 @@ HTML_TEMPLATE = """
         }
 
         async function fetchHistory() {
-            const counterName = document.getElementById('counterName').value.trim();
+            const counterName = resolveCounter(document.getElementById('counterName').value) || '';
             const container = document.getElementById('historyContainer');
 
-            if (!isValidCounter(counterName)) {
-                container.innerHTML = '<p class="text-zinc-400 text-center py-8">Scan ID badge atau ketik nama petugas.</p>';
+            if (!counterName) {
+                container.innerHTML = '<p class="text-zinc-400 text-center py-8">Scan badge atau ketik nama petugas.</p>';
                 return;
             }
 
-            container.innerHTML = '<p class="text-zinc-400 text-center py-8 animate-pulse">Loading…</p>';
+            container.innerHTML = '<p class="text-zinc-400 text-center py-8 animate-pulse">Memuat…</p>';
 
             try {
                 const response = await fetch(`/history?name=${encodeURIComponent(counterName)}`);
@@ -845,7 +1212,7 @@ HTML_TEMPLATE = """
                         <div class="flex justify-between items-start gap-2">
                             <div class="min-w-0 flex-1">
                                 <div class="flex justify-between items-baseline gap-2">
-                                    <span class="font-mono text-sm font-semibold text-violet-700 truncate">${escapeHtml(item.location)}</span>
+                                    <span class="text-sm font-semibold text-violet-700 truncate">${escapeHtml(item.location)}</span>
                                     <span class="text-xl font-bold tabular-nums text-zinc-900 shrink-0">${escapeHtml(String(item.count))}</span>
                                 </div>
                                 <p class="text-sm font-medium text-zinc-700 truncate mt-0.5">${escapeHtml(item.sku)}</p>
@@ -872,32 +1239,29 @@ HTML_TEMPLATE = """
             const label = document.getElementById('submitBtnLabel');
             const spinner = document.getElementById('submitSpinner');
 
-            const counterName = document.getElementById('counterName').value.trim();
+            const counterName = resolveCounter(document.getElementById('counterName').value);
+            const resolvedLocation = resolveLocation(locInput);
+            const resolvedSku = resolveSku(skuInput);
 
-            if (!isValidCounter(counterName)) {
+            if (!counterName) {
                 showToast('Scan ID badge petugas dulu.', 'warning');
                 return;
             }
 
-            if (!locInput || !skuInput || countInput === '') {
-                showToast('Complete location, SKU, and count before submitting.', 'warning');
-                return;
-            }
-
-            if (!isValidLocation(locInput)) {
-                showToast('Lokasi tidak valid. Scan QR lokasi yang benar.', 'warning');
+            if (!resolvedLocation || !resolvedSku || countInput === '') {
+                showToast('Lengkapi lokasi, SKU, dan jumlah sebelum submit.', 'warning');
                 return;
             }
 
             btn.disabled = true;
             btn.dataset.loading = '1';
-            label.textContent = 'Saving…';
+            label.textContent = 'Menyimpan…';
             spinner.classList.remove('hidden');
 
             const payload = {
                 counter_name: counterName,
-                location: locInput,
-                sku: skuInput,
+                location: resolvedLocation,
+                sku: resolvedSku,
                 count: countInput,
                 notes: document.getElementById('notes').value.trim()
             };
@@ -919,7 +1283,7 @@ HTML_TEMPLATE = """
                     showToast('Count saved successfully.', 'success');
                     document.getElementById('count').value = '0';
                     document.getElementById('notes').value = '';
-                    lockFormPostSubmit();
+                    resetLocationAndSku();
                     fetchHistory();
                 } else {
                     showToast('Sync failed. Try again.', 'error');
@@ -928,7 +1292,7 @@ HTML_TEMPLATE = """
                 showToast('Network error. Try again.', 'error');
             } finally {
                 btn.dataset.loading = '0';
-                label.textContent = 'Submit to master sheet';
+                label.textContent = 'Kirim ke sheet';
                 spinner.classList.add('hidden');
                 updateSubmitState();
             }
@@ -1112,47 +1476,40 @@ def home():
     location_lookup = {}
     counter_lookup = {}
     valid_counters = []
+    lookup_warnings = []
     try:
         wb = get_spreadsheet()
-        location_lookup = get_valid_locations(wb)
-        counter_lookup = get_valid_counters(wb)
+        location_lookup, loc_warnings = get_valid_locations(wb)
+        counter_lookup, counter_warnings = get_valid_counters(wb)
+        lookup_warnings = loc_warnings + counter_warnings
         valid_locations = sorted(set(location_lookup.values()))
         valid_counters = sorted(set(counter_lookup.values()))
-        sku_worksheet = wb.worksheet("SKU List")
-        list_of_lists = sku_worksheet.get_all_values()
-        
-        if len(list_of_lists) > 1:
-            headers = list_of_lists[0]
-            sku_idx = headers.index("SKU Code") if "SKU Code" in headers else 0
-            type_idx = headers.index("SKU Type") if "SKU Type" in headers else 1
-            cat_idx = headers.index("SKU Category") if "SKU Category" in headers else 2
-            
-            for row in list_of_lists[1:]:
-                if len(row) <= max(sku_idx, type_idx, cat_idx):
-                    continue
-                
-                sku_code = str(row[sku_idx]).strip()
-                goods_type = str(row[type_idx]).strip() or "General Goods"
-                category = str(row[cat_idx]).strip() or "Unassigned"
-                
-                if not sku_code:
-                    continue
-                
-                if goods_type not in sku_tree:
-                    sku_tree[goods_type] = {}
-                if category not in sku_tree[goods_type]:
-                    sku_tree[goods_type][category] = []
-                    
-                if sku_code not in sku_tree[goods_type][category]:
-                    sku_tree[goods_type][category].append(sku_code)
-                    
+        sku_tree = load_sku_tree(wb)
+        if not sku_tree:
+            sku_tree = {
+                "Finished": {
+                    "Brushes": ["AR-BRSH-01", "AR-BRSH-02"]
+                }
+            }
     except Exception:
         sku_tree = {
             "Finished": {
                 "Brushes": ["AR-BRSH-01", "AR-BRSH-02"]
             }
         }
+        if not location_lookup:
+            location_lookup = {}
+        if not counter_lookup:
+            counter_lookup = {}
         
+    boot_data = {
+        "sku_tree": sku_tree,
+        "location_lookup": location_lookup,
+        "counter_lookup": counter_lookup,
+        "valid_locations": valid_locations,
+        "valid_counters": valid_counters,
+        "lookup_warnings": lookup_warnings,
+    }
     return render_template_string(
         HTML_TEMPLATE,
         sku_tree=sku_tree,
@@ -1160,19 +1517,22 @@ def home():
         location_lookup=location_lookup,
         counter_lookup=counter_lookup,
         valid_counters=valid_counters,
+        lookup_warnings=lookup_warnings,
+        boot_data=boot_data,
     )
 
 @app.route('/api/lookups')
 def api_lookups():
     try:
         wb = get_spreadsheet()
-        location_lookup = get_valid_locations(wb)
-        counter_lookup = get_valid_counters(wb)
+        location_lookup, loc_warnings = get_valid_locations(wb)
+        counter_lookup, counter_warnings = get_valid_counters(wb)
         return jsonify({
             "locations": location_lookup,
             "counters": counter_lookup,
             "location_count": len(location_lookup),
             "counter_count": len(counter_lookup),
+            "warnings": loc_warnings + counter_warnings,
         }), 200
     except Exception as e:
         return jsonify({
@@ -1180,6 +1540,7 @@ def api_lookups():
             "counters": {},
             "location_count": 0,
             "counter_count": 0,
+            "warnings": [],
             "error": str(e),
         }), 500
 
@@ -1205,11 +1566,21 @@ def summary_data():
 @app.route('/history', methods=['GET'])
 def history():
     try:
-        target_name = request.args.get('name', '').strip()
+        raw_name = request.args.get('name', '').strip()
         wb = get_spreadsheet()
+        counter_lookup, _ = get_valid_counters(wb)
+        target_name = resolve_counter(raw_name, counter_lookup) or raw_name
         sheet = wb.worksheet("Raw Counts")
         all_records = sheet.get_all_records()
         
+        def row_matches_counter(row):
+            row_name = get_row_counter_name(row)
+            if not row_name or not target_name:
+                return False
+            if row_name == target_name:
+                return True
+            return resolve_counter(row_name, counter_lookup) == target_name
+
         counter_data = [
             {
                 "id": row.get("Log ID"),
@@ -1219,7 +1590,7 @@ def history():
                 "timestamp": row.get("Timestamp"),
                 "notes": row.get("Notes") or ""
             }
-            for row in all_records if get_row_counter_name(row) == target_name
+            for row in all_records if row_matches_counter(row)
         ]
         return jsonify(list(reversed(counter_data))), 200
     except Exception:
@@ -1232,7 +1603,7 @@ def submit():
         wb = get_spreadsheet()
         sheet = wb.worksheet("Raw Counts")
         
-        counter_lookup = get_valid_counters(wb)
+        counter_lookup, _ = get_valid_counters(wb)
         counter_name = resolve_counter(data.get('counter_name', ''), counter_lookup)
 
         if not counter_lookup:
@@ -1247,7 +1618,7 @@ def submit():
                 "message": "Nama petugas tidak valid. Scan ID badge atau ketik nama yang benar.",
             }), 400
 
-        location_lookup = get_valid_locations(wb)
+        location_lookup, _ = get_valid_locations(wb)
         loc_string = resolve_location(data.get('location', ''), location_lookup)
 
         if not location_lookup:
@@ -1263,17 +1634,32 @@ def submit():
                 "message": f"Lokasi tidak valid: {raw}. Scan QR lokasi yang benar.",
             }), 400
 
+        sku_tree = load_sku_tree(wb)
+        if not sku_tree:
+            return jsonify({
+                "status": "error",
+                "message": "Daftar SKU tidak tersedia. Periksa tab SKU List di sheet.",
+            }), 400
+
+        sku_code = resolve_sku(data.get('sku', ''), sku_tree)
+        if not sku_code:
+            raw_sku = str(data.get('sku', '')).strip()
+            return jsonify({
+                "status": "invalid_sku",
+                "message": f"SKU tidak valid: {raw_sku}. Pilih atau scan SKU dari daftar.",
+            }), 400
+
         # --- FEATURE 1: REAL-TIME DUPLICATE DETECTOR INTERCEPTOR ---
         all_records = sheet.get_all_records()
         for row in all_records:
             if (str(row.get("Precise Location")).strip() == loc_string and 
-                str(row.get("SKU Code")).strip() == str(data['sku']).strip() and 
+                str(row.get("SKU Code")).strip() == sku_code and 
                 get_row_counter_name(row) == counter_name):
                 
                 return jsonify({
                     "status": "duplicate",
                     "message": (
-                        f"Sudah tercatat: {data['sku']} di {loc_string} "
+                        f"Sudah tercatat: {sku_code} di {loc_string} "
                         f"(jumlah {row.get('Physical Count')}). "
                         f"Ubah lewat Edit di tab Riwayat."
                     ),
@@ -1290,7 +1676,14 @@ def submit():
         jakarta_tz = pytz.timezone('Asia/Jakarta')
         now_wib = datetime.now(jakarta_tz)
         timestamp = now_wib.strftime("%d/%m/%Y %H:%M:%S")
-        notes = data['notes'].strip()
+        notes = str(data.get('notes', '')).strip()
+        
+        try:
+            physical_count = int(data['count'])
+        except (ValueError, TypeError):
+            return jsonify({"status": "error", "message": "Jumlah tidak valid."}), 400
+        if physical_count < 0:
+            return jsonify({"status": "error", "message": "Jumlah tidak boleh negatif."}), 400
         
         row_to_append = [
             log_id,              # Column A: Log ID
@@ -1299,8 +1692,8 @@ def submit():
             rack,                # Column D: Rack
             shelf,               # Column E: Shelf
             loc_string,          # Column F: Precise Location
-            data['sku'],         # Column G: SKU Code
-            int(data['count']),  # Column H: Physical Count
+            sku_code,            # Column G: SKU Code
+            physical_count,    # Column H: Physical Count
             timestamp,           # Column I: Timestamp
             notes                # Column J: Notes
         ]
