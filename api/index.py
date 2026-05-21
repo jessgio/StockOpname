@@ -98,6 +98,32 @@ def read_codes_from_sheet(ws, header_aliases, default_col=0):
             codes.append(val)
     return codes
 
+def read_codes_from_column_a(ws, header_aliases):
+    """Read counter/location names from column A; skip row 1 only if A1 is a header label."""
+    try:
+        rows = ws.get_all_values()
+    except Exception:
+        return []
+
+    if not rows:
+        return []
+
+    header_aliases_lower = {h.lower() for h in header_aliases}
+    start = 0
+    if rows[0]:
+        first = str(rows[0][0]).strip().lower()
+        if first in header_aliases_lower:
+            start = 1
+
+    codes = []
+    for row in rows[start:]:
+        if not row:
+            continue
+        val = str(row[0]).strip()
+        if val:
+            codes.append(val)
+    return codes
+
 def build_lookup(codes, sheet_label="", normalize_kind="any"):
     """Map normalized lowercase key -> canonical value. Returns (lookup, warning_messages)."""
     lookup = {}
@@ -115,6 +141,14 @@ def build_lookup(codes, sheet_label="", normalize_kind="any"):
                 f"{prefix}'{lookup[key]}' bentrok dengan '{canonical}' (kode sama setelah normalisasi)"
             )
         lookup[key] = canonical
+        plain = " ".join(canonical.lower().split())
+        if plain and plain != key:
+            if plain in lookup and lookup[plain] != canonical:
+                prefix = f"{sheet_label}: " if sheet_label else ""
+                warnings.append(
+                    f"{prefix}'{lookup[plain]}' bentrok dengan '{canonical}' (varian huruf sama)"
+                )
+            lookup[plain] = canonical
     return lookup, warnings
 
 def get_valid_locations(wb):
@@ -140,10 +174,14 @@ def get_valid_counters(wb):
     ws = get_worksheet_by_names(wb, ("COUNTERS", "Counters", "Counter"))
     if not ws:
         return {}, []
-    codes = read_codes_from_sheet(
-        ws,
-        ("counter", "counter name", "nama", "nama petugas", "petugas", "name", "counters", "id badge", "badge", "kode"),
+    counter_aliases = (
+        "counter", "counter name", "nama", "nama petugas", "petugas",
+        "name", "counters", "id badge", "badge", "kode",
     )
+    # COUNTERS names live in column A; header-in-column-B must not empty the list.
+    codes = read_codes_from_column_a(ws, counter_aliases)
+    if not codes:
+        codes = read_codes_from_sheet(ws, counter_aliases)
     return build_lookup(codes, "COUNTERS", "counter")
 
 def resolve_counter(name, counter_lookup):
@@ -724,6 +762,9 @@ HTML_TEMPLATE = """
             if (counterInput) {
                 counterInput.addEventListener('input', onCounterNameInput);
                 counterInput.addEventListener('blur', onCounterNameInput);
+                counterInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') onCounterNameInput(e);
+                });
             }
             const backdrop = document.getElementById('scanModalBackdrop');
             if (backdrop) {
@@ -881,9 +922,15 @@ HTML_TEMPLATE = """
         function resolveCounter(name) {
             const trimmed = String(name || '').trim();
             if (!trimmed) return null;
-            if (validCounters.has(trimmed)) return trimmed;
             const key = normalizeScanText(trimmed, 'counter').toLowerCase();
-            return counterLookup[key] || null;
+            if (key && counterLookup[key]) return counterLookup[key];
+            const plain = trimmed.toLowerCase().replace(/\s+/g, ' ');
+            if (plain && counterLookup[plain]) return counterLookup[plain];
+            if (validCounters.has(trimmed)) return trimmed;
+            for (const c of validCounters) {
+                if (String(c).toLowerCase() === plain) return c;
+            }
+            return null;
         }
 
         function isValidCounter(name) {
@@ -901,7 +948,7 @@ HTML_TEMPLATE = """
             const resolved = resolveCounter(text);
             if (!resolved) {
                 const scanned = normalizeScanText(text, 'counter') || String(text).trim();
-                showToast(`Petugas tidak dikenali: "${scanned.slice(0, 40)}". Periksa tab COUNTERS.`, 'warning');
+                showToast(`Petugas tidak dikenali: "${scanned.slice(0, 40)}". Ketik nama sesuai dengan ID badge.`, 'warning');
                 return false;
             }
             document.getElementById('counterName').value = resolved;
@@ -910,7 +957,45 @@ HTML_TEMPLATE = """
             return true;
         }
 
-        function onCounterNameInput() {
+        let lastCounterNameToast = '';
+        async function onCounterNameInput(ev) {
+            const counterInput = document.getElementById('counterName');
+            const trimmed = String(counterInput.value || '').trim();
+            const isCommit = ev && (ev.type === 'blur' || (ev.type === 'keydown' && ev.key === 'Enter'));
+
+            if (!trimmed) {
+                lastCounterNameToast = '';
+                syncUIState();
+                return;
+            }
+
+            if (!Object.keys(counterLookup).length) {
+                await loadLookups();
+            }
+
+            const resolved = resolveCounter(counterInput.value);
+            if (!resolved) {
+                if (isCommit) {
+                    let msg;
+                    let type = 'warning';
+                    if (!Object.keys(counterLookup).length) {
+                        msg = 'Daftar petugas belum dimuat. Hubungi admin.';
+                        type = 'error';
+                    } else {
+                        const key = normalizeScanText(trimmed, 'counter') || trimmed;
+                        msg = `Petugas tidak dikenali: "${String(key).slice(0, 40)}". Ketik nama sesuai dengan ID badge.`;
+                    }
+                    if (lastCounterNameToast !== msg) {
+                        showToast(msg, type);
+                        lastCounterNameToast = msg;
+                    }
+                }
+            } else {
+                lastCounterNameToast = '';
+                if (isCommit && counterInput.value !== resolved) {
+                    counterInput.value = resolved;
+                }
+            }
             syncUIState();
         }
 
@@ -1609,13 +1694,13 @@ def submit():
         if not counter_lookup:
             return jsonify({
                 "status": "error",
-                "message": "Daftar petugas tidak tersedia. Periksa tab COUNTERS di sheet.",
+                "message": "Daftar petugas tidak tersedia. Ketik nama sesuai dengan ID badge.",
             }), 400
 
         if not counter_name:
             return jsonify({
                 "status": "invalid_counter",
-                "message": "Nama petugas tidak valid. Scan ID badge atau ketik nama yang benar.",
+                "message": "Nama petugas tidak valid. Scan ID badge atau ketik nama sesuai dengan ID badge.",
             }), 400
 
         location_lookup, _ = get_valid_locations(wb)
