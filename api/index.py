@@ -308,6 +308,15 @@ HTML_TEMPLATE = """
         .step-locked { opacity: 0.65; }
         .step-locked button, .step-locked select { pointer-events: none; }
         .step-locked input:not([readonly]) { pointer-events: none; }
+        .location-sticky-bar {
+            position: sticky;
+            top: 0;
+            z-index: 45;
+            background: rgb(236 253 245 / 0.97);
+            backdrop-filter: blur(8px);
+            border-bottom: 2px solid #34d399;
+            box-shadow: 0 2px 8px rgb(16 185 129 / 0.12);
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
 </head>
@@ -353,6 +362,14 @@ HTML_TEMPLATE = """
             </div>
         </div>
     </header>
+
+    <div id="locationStickyBar" class="location-sticky-bar hidden" aria-live="polite">
+        <div class="max-w-md lg:max-w-5xl mx-auto px-4 py-2.5 flex items-center gap-2">
+            <span class="text-xs font-semibold uppercase tracking-wide text-emerald-800 shrink-0">Lokasi</span>
+            <span id="locationStickyValue" class="flex-1 min-w-0 text-base font-bold text-emerald-950 truncate"></span>
+            <button type="button" id="changeLocationBtn" class="shrink-0 text-xs font-semibold text-emerald-800 bg-emerald-100 hover:bg-emerald-200 px-2.5 py-1 rounded-md">Ubah</button>
+        </div>
+    </div>
 
     <div id="lookupWarnings" class="hidden max-w-md lg:max-w-5xl mx-auto px-4">
         <div class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 space-y-1"></div>
@@ -534,6 +551,7 @@ HTML_TEMPLATE = """
         let validLocations = new Set(_boot.valid_locations || []);
         let validCounters = new Set(_boot.valid_counters || []);
         let currentTarget = '';
+        let locationFrozen = false;
         let scannerRunning = false;
         let lastHandledScan = { key: '', at: 0, target: '' };
         let html5QrcodeScanner = null;
@@ -658,6 +676,46 @@ HTML_TEMPLATE = """
             if (key) lastHandledScan = { key, at: Date.now(), target: target || currentTarget };
         }
 
+        function updateLocationStickyBar() {
+            const bar = document.getElementById('locationStickyBar');
+            const valEl = document.getElementById('locationStickyValue');
+            if (!bar || !valEl) return;
+            const loc = resolveLocation(document.getElementById('location').value);
+            if (locationFrozen && loc) {
+                valEl.textContent = loc;
+                bar.classList.remove('hidden');
+            } else {
+                bar.classList.add('hidden');
+            }
+        }
+
+        function freezeLocation() {
+            locationFrozen = true;
+            document.getElementById('scanLocationBtn').disabled = true;
+            updateLocationUI();
+            updateLocationStickyBar();
+        }
+
+        function unfreezeLocation() {
+            locationFrozen = false;
+            const counterOk = isValidCounter(document.getElementById('counterName').value);
+            document.getElementById('scanLocationBtn').disabled = !counterOk;
+            updateLocationUI();
+            updateLocationStickyBar();
+        }
+
+        function requestChangeLocation() {
+            if (!locationFrozen) return;
+            if (!confirm('Ganti lokasi? Anda perlu scan QR lokasi baru sebelum menghitung produk.')) return;
+            const locInput = document.getElementById('location');
+            locInput.value = '';
+            locInput.className = CLS.locLocked;
+            unfreezeLocation();
+            lockSkuFields();
+            updateStepperUI();
+            updateSubmitState();
+        }
+
         function updateLocationUI() {
             const locInput = document.getElementById('location');
             const hint = document.getElementById('locationHint');
@@ -666,12 +724,17 @@ HTML_TEMPLATE = """
                 if (hint) hint.textContent = 'Pastikan lokasi terscan dahulu sebelum scan produk.';
                 locInput.placeholder = 'Scan kode QR lokasi';
             } else if (locInput.value.trim()) {
-                if (hint) hint.textContent = 'Lokasi terisi. Tekan Scan untuk mengganti.';
+                if (locationFrozen) {
+                    if (hint) hint.textContent = 'Lokasi terkunci di atas. Gunakan Ubah hanya jika pindah rak.';
+                } else if (hint) {
+                    hint.textContent = 'Lokasi terisi. Tekan Scan untuk mengganti.';
+                }
                 locInput.placeholder = locInput.value;
             } else {
-                if (hint) hint.textContent = 'Pastikan lokasi terscan dahulu sebelum scan produk.';
+                if (hint) hint.textContent = 'Scan kode QR lokasi sebelum scan produk.';
                 locInput.placeholder = 'Scan kode QR lokasi';
             }
+            updateLocationStickyBar();
         }
 
         function lockSkuFields() {
@@ -692,8 +755,35 @@ HTML_TEMPLATE = """
             const locInput = document.getElementById('location');
             locInput.value = '';
             locInput.className = CLS.locLocked;
-            updateLocationUI();
+            unfreezeLocation();
             lockSkuFields();
+            updateStepperUI();
+            updateSubmitState();
+        }
+
+        function enableSkuFields() {
+            document.getElementById('scanSkuBtn').disabled = false;
+            const typeSelect = document.getElementById('skuType');
+            typeSelect.disabled = false;
+            typeSelect.className = CLS.selUnlocked;
+            typeSelect.innerHTML = '<option value="">Pilih jenis barang</option>';
+            Object.keys(skuTree).sort().forEach(type => {
+                typeSelect.options[typeSelect.options.length] = new Option(type, type);
+            });
+            const catSelect = document.getElementById('skuCategory');
+            catSelect.disabled = true;
+            catSelect.innerHTML = '<option value="">Pilih jenis dulu</option>';
+            catSelect.className = CLS.selLocked;
+            const skuSelect = document.getElementById('skuSelector');
+            skuSelect.disabled = true;
+            skuSelect.innerHTML = '<option value="">Pilih kategori dulu</option>';
+            skuSelect.className = CLS.selLocked;
+        }
+
+        function resetSkuAndCount() {
+            document.getElementById('count').value = '0';
+            document.getElementById('notes').value = '';
+            enableSkuFields();
             updateStepperUI();
             updateSubmitState();
         }
@@ -706,15 +796,24 @@ HTML_TEMPLATE = """
             if (isValidCounter(counterInput.value)) {
                 counterInput.className = CLS.counterUnlocked;
                 counterInput.removeAttribute('readonly');
-                document.getElementById('scanLocationBtn').disabled = false;
+                if (!locationFrozen) {
+                    document.getElementById('scanLocationBtn').disabled = false;
+                }
                 setStepCardEnabled('step2Card', true);
                 updateLocationUI();
                 if (locInput.value.trim() && isValidLocation(locInput.value)) {
-                    unlockFormForLocation();
+                    locInput.className = CLS.locUnlocked;
+                    if (!locationFrozen) {
+                        unlockFormForLocation();
+                    } else {
+                        document.getElementById('scanSkuBtn').disabled = false;
+                        updateLocationUI();
+                    }
                 } else {
                     if (locInput.value.trim() && !isValidLocation(locInput.value)) {
                         locInput.value = '';
                     }
+                    unfreezeLocation();
                     lockSkuFields();
                     locInput.className = CLS.locLocked;
                 }
@@ -726,7 +825,7 @@ HTML_TEMPLATE = """
                 setStepCardEnabled('step2Card', false);
                 locInput.value = '';
                 locInput.className = CLS.locLocked;
-                updateLocationUI();
+                unfreezeLocation();
                 lockSkuFields();
                 historyContainer.innerHTML = '<p class="text-zinc-400 text-center py-8">Scan badge atau ketik nama petugas.</p>';
             }
@@ -764,6 +863,13 @@ HTML_TEMPLATE = """
                 counterInput.addEventListener('blur', onCounterNameInput);
                 counterInput.addEventListener('keydown', (e) => {
                     if (e.key === 'Enter') onCounterNameInput(e);
+                });
+            }
+            const changeLocBtn = document.getElementById('changeLocationBtn');
+            if (changeLocBtn) {
+                changeLocBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    requestChangeLocation();
                 });
             }
             const backdrop = document.getElementById('scanModalBackdrop');
@@ -1061,18 +1167,8 @@ HTML_TEMPLATE = """
         function unlockFormForLocation() {
             const locInput = document.getElementById('location');
             locInput.className = CLS.locUnlocked;
-            updateLocationUI();
-
-            document.getElementById('scanSkuBtn').disabled = false;
-
-            const typeSelect = document.getElementById('skuType');
-            typeSelect.disabled = false;
-            typeSelect.className = CLS.selUnlocked;
-            typeSelect.innerHTML = '<option value="">Pilih jenis barang</option>';
-            Object.keys(skuTree).sort().forEach(type => {
-                typeSelect.options[typeSelect.options.length] = new Option(type, type);
-            });
-
+            freezeLocation();
+            enableSkuFields();
             updateStepperUI();
             updateSubmitState();
         }
@@ -1142,6 +1238,10 @@ HTML_TEMPLATE = """
         }
 
         async function openScanModal(target) {
+            if (target === 'location' && locationFrozen) {
+                showToast('Lokasi terkunci. Tekan Ubah di bar hijau atas untuk ganti lokasi.', 'warning');
+                return;
+            }
             if (target === 'location' && document.getElementById('scanLocationBtn').disabled) return;
             if (target === 'sku' && document.getElementById('scanSkuBtn').disabled) return;
             if (typeof Html5Qrcode === 'undefined') {
@@ -1366,9 +1466,7 @@ HTML_TEMPLATE = """
                     showToast(result.message || 'Lokasi tidak valid.', 'warning');
                 } else if (response.ok) {
                     showToast('Count saved successfully.', 'success');
-                    document.getElementById('count').value = '0';
-                    document.getElementById('notes').value = '';
-                    resetLocationAndSku();
+                    resetSkuAndCount();
                     fetchHistory();
                 } else {
                     showToast('Sync failed. Try again.', 'error');
