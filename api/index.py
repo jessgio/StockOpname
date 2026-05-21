@@ -69,6 +69,38 @@ def get_row_counter_name(row):
     """Read counter from new or legacy column header."""
     return str(row.get("Counter Name") or row.get("Counter Team") or "").strip()
 
+def parse_physical_count(value):
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return 0
+
+def aggregate_counts_by_sku(records):
+    """Sum Physical Count per SKU Code from Raw Counts rows."""
+    by_sku = {}
+    for row in records:
+        sku = str(row.get("SKU Code", "")).strip()
+        if not sku:
+            continue
+        count = parse_physical_count(row.get("Physical Count"))
+        if sku not in by_sku:
+            by_sku[sku] = {"total": 0, "locations": set()}
+        by_sku[sku]["total"] += count
+        loc = str(row.get("Precise Location", "")).strip()
+        if loc:
+            by_sku[sku]["locations"].add(loc)
+
+    rows = [
+        {
+            "sku": sku,
+            "total": data["total"],
+            "location_count": len(data["locations"]),
+        }
+        for sku, data in sorted(by_sku.items())
+    ]
+    grand_total = sum(r["total"] for r in rows)
+    return rows, grand_total
+
 # --- HTML INTERFACE WITH DUPLICATE PROTECTION & AUTO-RESET ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -90,7 +122,13 @@ HTML_TEMPLATE = """
     <!-- Sticky header: brand + counter + location -->
     <header class="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-zinc-200 shadow-sm">
         <div class="max-w-md lg:max-w-5xl mx-auto px-4 pt-3 pb-3">
-            <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Aeris Beaute</h1>
+            <div class="flex items-center justify-between gap-3 mb-1">
+                <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Aeris Beaute</h1>
+                <nav class="flex gap-3 text-xs font-semibold shrink-0">
+                    <span class="text-violet-700">Count</span>
+                    <a href="/summary" class="text-zinc-500 hover:text-violet-700">Summary</a>
+                </nav>
+            </div>
             <p class="text-xs text-zinc-500 mb-3">Stock Opname 2026</p>
             <div class="space-y-3">
                 <div>
@@ -790,6 +828,132 @@ HTML_TEMPLATE = """
 </html>
 """
 
+SUMMARY_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SKU Summary — Aeris Opname</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+</head>
+<body class="bg-zinc-50 font-sans text-zinc-900 antialiased min-h-screen">
+
+    <header class="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-zinc-200 shadow-sm">
+        <div class="max-w-3xl mx-auto px-4 py-3">
+            <div class="flex items-center justify-between gap-3">
+                <div>
+                    <h1 class="text-lg font-bold text-zinc-900 tracking-tight">SKU Summary</h1>
+                    <p class="text-xs text-zinc-500">Running totals from Raw Counts</p>
+                </div>
+                <nav class="flex gap-3 text-xs font-semibold shrink-0">
+                    <a href="/" class="text-zinc-500 hover:text-violet-700">Count</a>
+                    <span class="text-violet-700">Summary</span>
+                </nav>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-3xl mx-auto px-4 py-4 space-y-4">
+        <div class="flex flex-col sm:flex-row sm:items-center gap-3">
+            <input type="search" id="searchSku" placeholder="Cari SKU…" oninput="filterTable()"
+                class="flex-1 border border-zinc-200 rounded-lg px-3 py-2.5 text-sm focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+            <button type="button" onclick="loadSummary()" class="shrink-0 px-4 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-sm font-semibold transition">
+                Refresh
+            </button>
+        </div>
+
+        <div class="bg-white rounded-xl border border-zinc-200 shadow-sm overflow-hidden">
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead class="bg-zinc-50 border-b border-zinc-200">
+                        <tr>
+                            <th class="text-left px-4 py-3 font-semibold text-zinc-700">SKU Code</th>
+                            <th class="text-right px-4 py-3 font-semibold text-zinc-700">Total qty</th>
+                            <th class="text-right px-4 py-3 font-semibold text-zinc-700 hidden sm:table-cell">Lokasi</th>
+                        </tr>
+                    </thead>
+                    <tbody id="summaryBody">
+                        <tr><td colspan="3" class="px-4 py-8 text-center text-zinc-400">Loading…</td></tr>
+                    </tbody>
+                    <tfoot id="summaryFoot" class="bg-violet-50 border-t border-violet-100 hidden">
+                        <tr>
+                            <td class="px-4 py-3 font-bold text-zinc-800">Grand total</td>
+                            <td id="grandTotal" class="px-4 py-3 text-right font-bold text-violet-800 tabular-nums">0</td>
+                            <td id="skuCount" class="px-4 py-3 text-right text-sm text-zinc-600 hidden sm:table-cell"></td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </div>
+        </div>
+        <p id="lastUpdated" class="text-xs text-zinc-400 text-center"></p>
+    </main>
+
+    <script>
+        let summaryRows = [];
+
+        function escapeHtml(str) {
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function renderTable(rows, grandTotal) {
+            const body = document.getElementById('summaryBody');
+            const foot = document.getElementById('summaryFoot');
+
+            if (!rows.length) {
+                body.innerHTML = '<tr><td colspan="3" class="px-4 py-8 text-center text-zinc-400">Belum ada data di Raw Counts.</td></tr>';
+                foot.classList.add('hidden');
+                return;
+            }
+
+            body.innerHTML = rows.map(r => `
+                <tr class="summary-row border-b border-zinc-100 hover:bg-zinc-50/80" data-sku="${escapeHtml(r.sku).toLowerCase()}">
+                    <td class="px-4 py-3 font-mono font-semibold text-violet-700">${escapeHtml(r.sku)}</td>
+                    <td class="px-4 py-3 text-right font-bold tabular-nums text-zinc-900">${escapeHtml(String(r.total))}</td>
+                    <td class="px-4 py-3 text-right text-zinc-500 hidden sm:table-cell">${escapeHtml(String(r.location_count))}</td>
+                </tr>
+            `).join('');
+
+            document.getElementById('grandTotal').textContent = grandTotal;
+            document.getElementById('skuCount').textContent = rows.length + ' SKU';
+            foot.classList.remove('hidden');
+        }
+
+        function filterTable() {
+            const q = document.getElementById('searchSku').value.trim().toLowerCase();
+            const filtered = q
+                ? summaryRows.filter(r => r.sku.toLowerCase().includes(q))
+                : summaryRows;
+            const grand = filtered.reduce((s, r) => s + r.total, 0);
+            renderTable(filtered, grand);
+        }
+
+        async function loadSummary() {
+            const body = document.getElementById('summaryBody');
+            body.innerHTML = '<tr><td colspan="3" class="px-4 py-8 text-center text-zinc-400 animate-pulse">Loading…</td></tr>';
+
+            try {
+                const res = await fetch('/summary/data');
+                const data = await res.json();
+                summaryRows = data.rows || [];
+                renderTable(summaryRows, data.grand_total || 0);
+                document.getElementById('lastUpdated').textContent =
+                    'Diperbarui: ' + new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+            } catch (e) {
+                body.innerHTML = '<tr><td colspan="3" class="px-4 py-8 text-center text-rose-600">Gagal memuat data.</td></tr>';
+            }
+        }
+
+        window.onload = loadSummary;
+    </script>
+</body>
+</html>
+"""
+
 # --- ROUTES ---
 
 @app.route('/')
@@ -842,6 +1006,25 @@ def home():
         valid_locations=valid_locations,
         valid_counters=valid_counters,
     )
+
+@app.route('/summary')
+def summary_page():
+    return render_template_string(SUMMARY_HTML_TEMPLATE)
+
+@app.route('/summary/data')
+def summary_data():
+    try:
+        wb = get_spreadsheet()
+        sheet = wb.worksheet("Raw Counts")
+        records = sheet.get_all_records()
+        rows, grand_total = aggregate_counts_by_sku(records)
+        return jsonify({
+            "rows": rows,
+            "grand_total": grand_total,
+            "sku_count": len(rows),
+        }), 200
+    except Exception as e:
+        return jsonify({"rows": [], "grand_total": 0, "sku_count": 0, "error": str(e)}), 500
 
 @app.route('/history', methods=['GET'])
 def history():
@@ -924,8 +1107,8 @@ def submit():
         parts = loc_string.split('-')
         
         zone = parts[0] if len(parts) > 0 else loc_string[:1]
-        shelf = parts[1] if len(parts) > 1 else ""
-        bin_code = parts[2] if len(parts) > 2 else ""
+        rack = parts[1] if len(parts) > 1 else ""
+        shelf = parts[2] if len(parts) > 2 else ""
         
         jakarta_tz = pytz.timezone('Asia/Jakarta')
         now_wib = datetime.now(jakarta_tz)
@@ -936,14 +1119,13 @@ def submit():
             log_id,              # Column A: Log ID
             counter_name,        # Column B: Counter Name
             zone,                # Column C: Zone
-            shelf,               # Column D: Shelf
-            bin_code,            # Column E: Bin
+            rack,                # Column D: Rack
+            shelf,               # Column E: Shelf
             loc_string,          # Column F: Precise Location
             data['sku'],         # Column G: SKU Code
-            "",                  # Column H: Item Name
-            int(data['count']),  # Column I: Physical Count
-            timestamp,           # Column J: Timestamp
-            notes                # Column K: Notes
+            int(data['count']),  # Column H: Physical Count
+            timestamp,           # Column I: Timestamp
+            notes                # Column J: Notes
         ]
         
         sheet.append_row(row_to_append)
@@ -963,7 +1145,7 @@ def edit():
         cell = sheet.find(log_id)
         
         if cell:
-            sheet.update_cell(cell.row, 9, new_count)
+            sheet.update_cell(cell.row, 8, new_count)  # Column H: Physical Count
             return jsonify({"status": "success"}), 200
         return jsonify({"status": "error", "message": "Record row not found"}), 404
     except Exception as e:
