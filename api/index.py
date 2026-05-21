@@ -368,7 +368,7 @@ HTML_TEMPLATE = """
                             <input type="text" id="counterName" name="counterName" autocomplete="off" inputmode="text" placeholder="Ketik nama atau scan ID badge" class="opname-field flex-1 min-w-0 border border-amber-200 p-3 rounded-lg bg-amber-50 text-amber-900 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
                             <button type="button" id="scanCounterBtn" class="shrink-0 px-4 py-3 rounded-lg bg-violet-600 hover:bg-violet-700 active:bg-violet-800 text-white text-sm font-semibold disabled:opacity-40">Scan</button>
                         </div>
-                        <p class="text-xs text-zinc-500 mt-2">Scan QR pada ID badge, atau ketik nama persis seperti di sheet COUNTERS.</p>
+                        <p class="text-xs text-zinc-500 mt-2">Scan QR pada ID badge, atau ketik nama.</p>
                     </div>
                 </section>
 
@@ -381,10 +381,10 @@ HTML_TEMPLATE = """
                     <div class="p-4">
                         <label for="location" class="block text-sm font-medium text-zinc-700 mb-1.5">Kode lokasi</label>
                         <div class="flex gap-2">
-                            <input type="text" id="location" readonly tabindex="-1" placeholder="Belum di-scan" aria-describedby="locationHint" class="opname-field flex-1 min-w-0 border border-amber-200 p-3 rounded-lg bg-amber-50 text-amber-900">
+                            <input type="text" id="location" readonly tabindex="-1" placeholder="Scan kode QR lokasi" aria-describedby="locationHint" class="opname-field flex-1 min-w-0 border border-amber-200 p-3 rounded-lg bg-amber-50 text-amber-900">
                             <button type="button" id="scanLocationBtn" disabled class="shrink-0 px-4 py-3 rounded-lg bg-violet-600 hover:bg-violet-700 active:bg-violet-800 text-white text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed">Scan</button>
                         </div>
-                        <p id="locationHint" class="text-xs text-zinc-500 mt-2">Isi petugas dulu, lalu scan QR lokasi.</p>
+                        <p id="locationHint" class="text-xs text-zinc-500 mt-2">Pastikan lokasi terscan dahulu sebelum scan produk.</p>
                     </div>
                 </section>
 
