@@ -30,9 +30,12 @@ def get_spreadsheet():
 
 _SPREADSHEET_CACHE = {"wb": None, "expires": 0.0}
 _SUMMARY_CACHE = {"payload": None, "expires": 0.0}
+_LOOKUPS_CACHE = {"payload": None, "expires": 0.0}
+_SKU_TREE_CACHE = {"tree": None, "expires": 0.0}
 _CACHE_LOCK = Lock()
 _SPREADSHEET_CACHE_TTL = int(os.environ.get("SPREADSHEET_CACHE_SECONDS", "300"))
 _SUMMARY_CACHE_TTL = int(os.environ.get("SUMMARY_CACHE_SECONDS", "30"))
+_LOOKUPS_CACHE_TTL = int(os.environ.get("LOOKUPS_CACHE_SECONDS", "300"))
 
 def get_spreadsheet_cached():
     now = time.time()
@@ -65,6 +68,84 @@ def read_raw_counts_for_summary(sheet):
             "Physical Count": padded[2],
         })
     return records
+
+def read_raw_count_rows(sheet):
+    """Fetch Raw Counts data rows (A–J) without get_all_records overhead."""
+    try:
+        values = sheet.get("A2:J")
+    except Exception:
+        return []
+    rows = []
+    for row in values:
+        padded = list(row) + [""] * 10
+        rows.append({
+            "Log ID": padded[0],
+            "Counter Name": padded[1],
+            "Counter Team": "",
+            "Precise Location": padded[5],
+            "SKU Code": padded[6],
+            "Physical Count": padded[7],
+            "Timestamp": padded[8],
+            "Notes": padded[9],
+        })
+    return rows
+
+def build_lookups_payload(force_refresh=False):
+    now = time.time()
+    if not force_refresh:
+        with _CACHE_LOCK:
+            cached = _LOOKUPS_CACHE["payload"]
+            if cached is not None and now < _LOOKUPS_CACHE["expires"]:
+                return cached, True
+
+    wb = get_spreadsheet_cached()
+    location_lookup, loc_warnings = get_valid_locations(wb)
+    counter_lookup, counter_warnings = get_valid_counters(wb)
+    payload = {
+        "location_lookup": location_lookup,
+        "counter_lookup": counter_lookup,
+        "lookup_warnings": loc_warnings + counter_warnings,
+    }
+    with _CACHE_LOCK:
+        _LOOKUPS_CACHE["payload"] = payload
+        _LOOKUPS_CACHE["expires"] = now + _LOOKUPS_CACHE_TTL
+    return payload, False
+
+def load_sku_tree_cached(wb, force_refresh=False):
+    now = time.time()
+    if not force_refresh:
+        with _CACHE_LOCK:
+            cached = _SKU_TREE_CACHE["tree"]
+            if cached is not None and now < _SKU_TREE_CACHE["expires"]:
+                return cached
+    tree = load_sku_tree(wb)
+    with _CACHE_LOCK:
+        _SKU_TREE_CACHE["tree"] = tree
+        _SKU_TREE_CACHE["expires"] = now + _LOOKUPS_CACHE_TTL
+    return tree
+
+def row_matches_counter(row, target_name, counter_lookup):
+    row_name = get_row_counter_name(row)
+    if not row_name or not target_name:
+        return False
+    if row_name == target_name:
+        return True
+    return resolve_counter(row_name, counter_lookup) == target_name
+
+def find_duplicate_count_row(sheet, counter_name, loc_string, sku_code):
+    """Scan counter/location/SKU/qty columns (B, F–H) for an existing count."""
+    try:
+        values = sheet.get("B2:H")
+    except Exception:
+        return None
+    for row in values:
+        padded = list(row) + ["", "", "", "", "", "", ""]
+        row_counter = str(padded[0]).strip()
+        row_location = str(padded[4]).strip()
+        row_sku = str(padded[5]).strip()
+        if row_location == loc_string and row_sku == sku_code and row_counter == counter_name:
+            return padded[6]
+    return None
 
 def build_summary_payload(force_refresh=False):
     now = time.time()
@@ -645,8 +726,8 @@ HTML_TEMPLATE = """
         let locationLookup = _boot.location_lookup || {};
         let counterLookup = _boot.counter_lookup || {};
         let lookupWarnings = _boot.lookup_warnings || [];
-        let validLocations = new Set(_boot.valid_locations || []);
-        let validCounters = new Set(_boot.valid_counters || []);
+        let validLocations = new Set(Object.values(locationLookup));
+        let validCounters = new Set(Object.values(counterLookup));
         let currentTarget = '';
         let locationFrozen = false;
         let scannerRunning = false;
@@ -1064,7 +1145,6 @@ HTML_TEMPLATE = """
             resetPageInteractionState();
             bindScanButtons();
             showLookupWarnings(lookupWarnings);
-            await loadLookups();
             await syncUIState({ refreshHistory: true });
             syncTopChromeLayout();
             window.addEventListener('resize', () => {
@@ -1294,7 +1374,6 @@ HTML_TEMPLATE = """
             updateLocationUI();
             updateStepperUI();
             updateSubmitState();
-            fetchHistory();
         }
 
         let toastTimer;
@@ -1861,54 +1940,42 @@ def api_debug_log():
     return "", 204
 
 
+_FALLBACK_SKU_TREE = {
+    "Finished": {
+        "Brushes": ["AR-BRSH-01", "AR-BRSH-02"]
+    }
+}
+
 @app.route('/')
 def home():
-    sku_tree = {}
-    valid_locations = []
     location_lookup = {}
     counter_lookup = {}
-    valid_counters = []
     lookup_warnings = []
+    sku_tree = _FALLBACK_SKU_TREE
     try:
-        wb = get_spreadsheet()
-        location_lookup, loc_warnings = get_valid_locations(wb)
-        counter_lookup, counter_warnings = get_valid_counters(wb)
-        lookup_warnings = loc_warnings + counter_warnings
-        valid_locations = sorted(set(location_lookup.values()))
-        valid_counters = sorted(set(counter_lookup.values()))
-        sku_tree = load_sku_tree(wb)
-        if not sku_tree:
-            sku_tree = {
-                "Finished": {
-                    "Brushes": ["AR-BRSH-01", "AR-BRSH-02"]
-                }
-            }
+        lookups, _ = build_lookups_payload()
+        location_lookup = lookups["location_lookup"]
+        counter_lookup = lookups["counter_lookup"]
+        lookup_warnings = lookups["lookup_warnings"]
+        wb = get_spreadsheet_cached()
+        sku_tree = load_sku_tree_cached(wb) or _FALLBACK_SKU_TREE
     except Exception:
-        sku_tree = {
-            "Finished": {
-                "Brushes": ["AR-BRSH-01", "AR-BRSH-02"]
-            }
-        }
-        if not location_lookup:
-            location_lookup = {}
-        if not counter_lookup:
-            counter_lookup = {}
-        
+        location_lookup = location_lookup or {}
+        counter_lookup = counter_lookup or {}
+
     boot_data = {
         "sku_tree": sku_tree,
         "location_lookup": location_lookup,
         "counter_lookup": counter_lookup,
-        "valid_locations": valid_locations,
-        "valid_counters": valid_counters,
         "lookup_warnings": lookup_warnings,
     }
     return render_template_string(
         HTML_TEMPLATE,
         sku_tree=sku_tree,
-        valid_locations=valid_locations,
+        valid_locations=sorted(set(location_lookup.values())),
         location_lookup=location_lookup,
         counter_lookup=counter_lookup,
-        valid_counters=valid_counters,
+        valid_counters=sorted(set(counter_lookup.values())),
         lookup_warnings=lookup_warnings,
         boot_data=boot_data,
     )
@@ -1916,16 +1983,18 @@ def home():
 @app.route('/api/lookups')
 def api_lookups():
     try:
-        wb = get_spreadsheet()
-        location_lookup, loc_warnings = get_valid_locations(wb)
-        counter_lookup, counter_warnings = get_valid_counters(wb)
-        return jsonify({
-            "locations": location_lookup,
-            "counters": counter_lookup,
-            "location_count": len(location_lookup),
-            "counter_count": len(counter_lookup),
-            "warnings": loc_warnings + counter_warnings,
-        }), 200
+        force_refresh = request.args.get("refresh") in ("1", "true", "yes")
+        lookups, from_cache = build_lookups_payload(force_refresh=force_refresh)
+        response = jsonify({
+            "locations": lookups["location_lookup"],
+            "counters": lookups["counter_lookup"],
+            "location_count": len(lookups["location_lookup"]),
+            "counter_count": len(lookups["counter_lookup"]),
+            "warnings": lookups["lookup_warnings"],
+        })
+        if from_cache and not force_refresh:
+            response.headers["Cache-Control"] = f"private, max-age={_LOOKUPS_CACHE_TTL}"
+        return response, 200
     except Exception as e:
         return jsonify({
             "locations": {},
@@ -1956,19 +2025,12 @@ def summary_data():
 def history():
     try:
         raw_name = request.args.get('name', '').strip()
-        wb = get_spreadsheet()
-        counter_lookup, _ = get_valid_counters(wb)
+        lookups, _ = build_lookups_payload()
+        counter_lookup = lookups["counter_lookup"]
         target_name = resolve_counter(raw_name, counter_lookup) or raw_name
+        wb = get_spreadsheet_cached()
         sheet = wb.worksheet("Raw Counts")
-        all_records = sheet.get_all_records()
-        
-        def row_matches_counter(row):
-            row_name = get_row_counter_name(row)
-            if not row_name or not target_name:
-                return False
-            if row_name == target_name:
-                return True
-            return resolve_counter(row_name, counter_lookup) == target_name
+        all_records = read_raw_count_rows(sheet)
 
         counter_data = [
             {
@@ -1979,7 +2041,7 @@ def history():
                 "timestamp": row.get("Timestamp"),
                 "notes": row.get("Notes") or ""
             }
-            for row in all_records if row_matches_counter(row)
+            for row in all_records if row_matches_counter(row, target_name, counter_lookup)
         ]
         return jsonify(list(reversed(counter_data))), 200
     except Exception:
@@ -1989,10 +2051,12 @@ def history():
 def submit():
     try:
         data = request.json
-        wb = get_spreadsheet()
+        wb = get_spreadsheet_cached()
         sheet = wb.worksheet("Raw Counts")
-        
-        counter_lookup, _ = get_valid_counters(wb)
+
+        lookups, _ = build_lookups_payload()
+        counter_lookup = lookups["counter_lookup"]
+        location_lookup = lookups["location_lookup"]
         counter_name = resolve_counter(data.get('counter_name', ''), counter_lookup)
 
         if not counter_lookup:
@@ -2007,7 +2071,6 @@ def submit():
                 "message": "Nama petugas tidak valid. Scan ID badge atau ketik nama sesuai dengan ID badge.",
             }), 400
 
-        location_lookup, _ = get_valid_locations(wb)
         loc_string = resolve_location(data.get('location', ''), location_lookup)
 
         if not location_lookup:
@@ -2023,7 +2086,7 @@ def submit():
                 "message": f"Lokasi tidak valid: {raw}. Scan QR lokasi yang benar.",
             }), 400
 
-        sku_tree = load_sku_tree(wb)
+        sku_tree = load_sku_tree_cached(wb)
         if not sku_tree:
             return jsonify({
                 "status": "error",
@@ -2038,21 +2101,16 @@ def submit():
                 "message": f"SKU tidak valid: {raw_sku}. Pilih atau scan SKU dari daftar.",
             }), 400
 
-        # --- FEATURE 1: REAL-TIME DUPLICATE DETECTOR INTERCEPTOR ---
-        all_records = sheet.get_all_records()
-        for row in all_records:
-            if (str(row.get("Precise Location")).strip() == loc_string and 
-                str(row.get("SKU Code")).strip() == sku_code and 
-                get_row_counter_name(row) == counter_name):
-                
-                return jsonify({
-                    "status": "duplicate",
-                    "message": (
-                        f"Sudah tercatat: {sku_code} di {loc_string} "
-                        f"(jumlah {row.get('Physical Count')}). "
-                        f"Ubah lewat Edit di tab Riwayat."
-                    ),
-                }), 409
+        dup_count = find_duplicate_count_row(sheet, counter_name, loc_string, sku_code)
+        if dup_count is not None:
+            return jsonify({
+                "status": "duplicate",
+                "message": (
+                    f"Sudah tercatat: {sku_code} di {loc_string} "
+                    f"(jumlah {dup_count}). "
+                    f"Ubah lewat Edit di tab Riwayat."
+                ),
+            }), 409
 
         # Process standard row generation if duplicate test passes
         log_id = str(uuid.uuid4())[:8] 
@@ -2100,7 +2158,7 @@ def edit():
         log_id = data['id']
         new_count = data['count']
         
-        wb = get_spreadsheet()
+        wb = get_spreadsheet_cached()
         sheet = wb.worksheet("Raw Counts")
         cell = sheet.find(log_id)
         
@@ -2118,7 +2176,7 @@ def delete():
         data = request.json
         log_id = data['id']
         
-        wb = get_spreadsheet()
+        wb = get_spreadsheet_cached()
         sheet = wb.worksheet("Raw Counts")
         cell = sheet.find(log_id)
         
