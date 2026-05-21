@@ -11,8 +11,6 @@ import pytz
 
 app = Flask(__name__)
 
-_DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "debug-a76bd4.log")
-
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -105,12 +103,17 @@ def update_dup_index_entry(session_id, counter_name, loc_string, sku_code, count
         entry["index"][(counter_name, loc_string, sku_code)] = count
 
 def read_raw_counts_for_summary(sheet, session_id=None):
-    """Fetch location, SKU, qty (F–H) and filter by Session ID (K)."""
+    """Fetch location, SKU, qty (F–H) and Session ID (K) in one request; filter by session."""
     try:
-        values = sheet.get("F2:H")
-        session_col = sheet.get("K2:K")
+        batch = sheet.batch_get(["F2:H", "K2:K"])
+        values = batch[0] if batch else []
+        session_col = batch[1] if len(batch) > 1 else []
     except Exception:
-        return []
+        try:
+            values = sheet.get("F2:H")
+            session_col = sheet.get("K2:K")
+        except Exception:
+            return []
     records = []
     for i, row in enumerate(values):
         padded = list(row) + ["", "", ""]
@@ -1178,15 +1181,6 @@ HTML_TEMPLATE = """
             done: "shrink-0 flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold border-2 border-emerald-500 bg-emerald-500 text-white",
         };
 
-        // #region agent log
-        let _dbgHistoryCalls = 0;
-        function dbgLog(hypothesisId, location, message, data) {
-            const payload = { sessionId: 'a76bd4', hypothesisId, location, message, data: data || {}, timestamp: Date.now(), runId: 'post-fix' };
-            fetch('/api/debug-log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).catch(() => {});
-            fetch('http://127.0.0.1:7715/ingest/d5497b62-266c-4d71-9f16-7243fc1f0e15', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'a76bd4' }, body: JSON.stringify(payload) }).catch(() => {});
-        }
-        // #endregion
-
         function showLookupWarnings(warnings) {
             const box = document.getElementById('lookupWarnings');
             const inner = box.querySelector('div');
@@ -1435,15 +1429,9 @@ HTML_TEMPLATE = """
                 body.classList.add('opname-location-locked');
                 const h = Math.ceil(chrome.getBoundingClientRect().height);
                 body.style.setProperty('--opname-chrome-h', h + 'px');
-                // #region agent log
-                dbgLog('H-LAYOUT', 'syncTopChromeLayout', 'fixed chrome', { chromeH: h, locked: true });
-                // #endregion
             } else {
                 body.classList.remove('opname-location-locked');
                 body.style.removeProperty('--opname-chrome-h');
-                // #region agent log
-                dbgLog('H-LAYOUT', 'syncTopChromeLayout', 'sticky chrome', { locked: false });
-                // #endregion
             }
         }
 
@@ -1466,9 +1454,6 @@ HTML_TEMPLATE = """
             document.getElementById('scanLocationBtn').disabled = true;
             updateLocationUI();
             updateLocationStickyBar();
-            // #region agent log
-            dbgLog('H2', 'freezeLocation', 'location frozen', { loc: document.getElementById('location').value });
-            // #endregion
         }
 
         function unfreezeLocation() {
@@ -1566,17 +1551,6 @@ HTML_TEMPLATE = """
             const counterInput = document.getElementById('counterName');
             const locInput = document.getElementById('location');
             const historyContainer = document.getElementById('historyContainer');
-            // #region agent log
-            dbgLog('H1', 'syncUIState:entry', 'state snapshot', {
-                counterOk: isValidCounter(counterInput.value),
-                loc: locInput.value,
-                locValid: isValidLocation(locInput.value),
-                locationFrozen,
-                scanLocDisabled: document.getElementById('scanLocationBtn').disabled,
-                skuInputDisabled: document.getElementById('skuInput').disabled,
-                skuBtnDisabled: document.getElementById('scanSkuBtn').disabled,
-            });
-            // #endregion
 
             if (isValidCounter(counterInput.value)) {
                 counterInput.className = CLS.counterUnlocked;
@@ -1623,14 +1597,6 @@ HTML_TEMPLATE = """
             }
             updateStepperUI();
             updateSubmitState();
-            // #region agent log
-            dbgLog('H1', 'syncUIState:exit', 'after sync', {
-                locationFrozen,
-                scanLocDisabled: document.getElementById('scanLocationBtn').disabled,
-                skuInputDisabled: document.getElementById('skuInput').disabled,
-                stickyVisible: !document.getElementById('locationStickyBar').classList.contains('hidden'),
-            });
-            // #endregion
         }
 
         function getScanner() {
@@ -1648,9 +1614,6 @@ HTML_TEMPLATE = """
                 counterBtn.addEventListener('click', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    // #region agent log
-                    dbgLog('H0', 'scanCounterBtn:click', 'opening counter scan', {});
-                    // #endregion
                     openScanModal('counter');
                 });
             }
@@ -1692,9 +1655,6 @@ HTML_TEMPLATE = """
         }
 
         async function initApp() {
-            // #region agent log
-            dbgLog('H0', 'initApp', 'script loaded', { counterLookupKeys: Object.keys(counterLookup).length });
-            // #endregion
             const badge = document.getElementById('sessionBadge');
             if (badge && activeSession) {
                 badge.textContent = activeSession.sessionName || activeSession.sessionId;
@@ -1956,9 +1916,6 @@ HTML_TEMPLATE = """
             if (!locationFrozen) {
                 document.getElementById('scanLocationBtn').disabled = false;
             }
-            // #region agent log
-            dbgLog('H2', 'unlockAfterCounter', 'scanLocationBtn state', { locationFrozen, scanLocDisabled: document.getElementById('scanLocationBtn').disabled });
-            // #endregion
             updateLocationUI();
             updateStepperUI();
             updateSubmitState();
@@ -2150,10 +2107,6 @@ HTML_TEMPLATE = """
         }
 
         async function fetchHistory(forceRefresh = false) {
-            // #region agent log
-            _dbgHistoryCalls += 1;
-            dbgLog('H3', 'fetchHistory', 'called', { callCount: _dbgHistoryCalls });
-            // #endregion
             const counterName = resolveCounter(document.getElementById('counterName').value) || '';
             const container = document.getElementById('historyContainer');
 
@@ -2256,9 +2209,6 @@ HTML_TEMPLATE = """
                     showToast(result.message || 'Lokasi tidak valid.', 'warning');
                 } else if (response.ok) {
                     showToast('Count saved successfully.', 'success');
-                    // #region agent log
-                    dbgLog('H3', 'submitData:ok', 'submit success', { locationFrozen, loc: document.getElementById('location').value });
-                    // #endregion
                     resetSkuAndCount();
                     maybeFetchHistory(true);
                 } else {
@@ -2473,18 +2423,6 @@ SUMMARY_HTML_TEMPLATE = """
 """
 
 # --- ROUTES ---
-
-@app.route('/api/debug-log', methods=['POST'])
-def api_debug_log():
-    """Append NDJSON debug entries (debug session a76bd4)."""
-    try:
-        entry = request.get_json(silent=True) or {}
-        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    return "", 204
-
 
 @app.route('/')
 def session_page():
