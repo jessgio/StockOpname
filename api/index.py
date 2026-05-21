@@ -24,24 +24,61 @@ def get_spreadsheet():
     client = gspread.authorize(creds)
     return client.open("Aeris Beaute - Stock Opname Master Template")
 
+def normalize_location_code(code):
+    """Normalize scanned or sheet values for reliable matching."""
+    s = str(code or "").strip().replace("\ufeff", "").replace("\u200b", "")
+    if not s:
+        return ""
+    lower = s.lower()
+    if lower.startswith("http://") or lower.startswith("https://") or "://" in s:
+        s = s.rstrip("/").split("/")[-1]
+    if "?" in s:
+        s = s.split("?")[0]
+    if "#" in s:
+        s = s.split("#")[0]
+    return s.strip()
+
+def get_locations_worksheet(wb):
+    for name in ("LOCATIONS", "Locations", "Location"):
+        try:
+            return wb.worksheet(name)
+        except Exception:
+            continue
+    return None
+
 def get_valid_locations(wb):
-    """Return a set of allowed location codes from LOCATIONS column A."""
+    """Return dict of normalized key -> canonical location code from LOCATIONS column A."""
+    ws = get_locations_worksheet(wb)
+    if not ws:
+        return {}
+
     try:
-        ws = wb.worksheet("LOCATIONS")
         col_a = ws.col_values(1)
     except Exception:
-        return set()
+        return {}
 
-    locations = set()
+    lookup = {}
     header_names = {"location", "lokasi", "precise location", "locations", "kode lokasi"}
     for i, val in enumerate(col_a):
-        loc = str(val).strip()
-        if not loc:
+        canonical = str(val).strip()
+        if not canonical:
             continue
-        if i == 0 and loc.lower() in header_names:
+        if i == 0 and canonical.lower() in header_names:
             continue
-        locations.add(loc)
-    return locations
+        key = normalize_location_code(canonical).lower()
+        if key:
+            lookup[key] = canonical
+    return lookup
+
+def resolve_location(code, location_lookup):
+    """Match scanned text to a canonical location from the lookup."""
+    if not code or not location_lookup:
+        return None
+    trimmed = str(code).strip()
+    if trimmed in location_lookup.values():
+        return trimmed
+    key = normalize_location_code(trimmed).lower()
+    return location_lookup.get(key)
 
 def get_valid_counters(wb):
     """Return a set of allowed counter names from COUNTERS column A."""
@@ -273,6 +310,7 @@ HTML_TEMPLATE = """
     <script>
         const skuTree = {{ sku_tree|tojson|safe }};
         const validLocations = new Set({{ valid_locations|tojson|safe }});
+        const locationLookup = {{ location_lookup|tojson|safe }};
         const validCounters = new Set({{ valid_counters|tojson|safe }});
         let currentTarget = '';
         let scannerRunning = false;
@@ -467,9 +505,27 @@ HTML_TEMPLATE = """
             }, type === 'warning' ? 6000 : 3500);
         }
 
+        function normalizeLocation(code) {
+            let s = String(code || '').trim().replace(/\ufeff/g, '').replace(/\u200b/g, '');
+            if (!s) return '';
+            if (/^https?:\/\//i.test(s) || s.includes('://')) {
+                s = s.replace(/\/+$/, '').split('/').pop();
+            }
+            if (s.includes('?')) s = s.split('?')[0];
+            if (s.includes('#')) s = s.split('#')[0];
+            return s.trim();
+        }
+
+        function resolveLocation(code) {
+            const trimmed = String(code || '').trim();
+            if (!trimmed) return null;
+            if (validLocations.has(trimmed)) return trimmed;
+            const key = normalizeLocation(trimmed).toLowerCase();
+            return locationLookup[key] || null;
+        }
+
         function isValidLocation(code) {
-            const trimmed = code.trim();
-            return trimmed && validLocations.has(trimmed);
+            return !!resolveLocation(code);
         }
 
         function applyLocationScan(text) {
@@ -477,16 +533,17 @@ HTML_TEMPLATE = """
                 showToast('Scan ID badge petugas dulu.', 'warning');
                 return false;
             }
-            const trimmed = text.trim();
-            if (!validLocations.size) {
+            if (!Object.keys(locationLookup).length) {
                 showToast('Daftar lokasi belum dimuat. Hubungi admin.', 'error');
                 return false;
             }
-            if (!isValidLocation(trimmed)) {
-                showToast('Bukan kode lokasi valid. Scan QR lokasi, bukan SKU.', 'warning');
+            const resolved = resolveLocation(text);
+            if (!resolved) {
+                const scanned = normalizeLocation(text) || String(text).trim();
+                showToast(`Lokasi tidak dikenali: "${scanned.slice(0, 40)}". Periksa tab LOCATIONS.`, 'warning');
                 return false;
             }
-            document.getElementById('location').value = trimmed;
+            document.getElementById('location').value = resolved;
             unlockFormForLocation();
             return true;
         }
@@ -960,10 +1017,12 @@ SUMMARY_HTML_TEMPLATE = """
 def home():
     sku_tree = {}
     valid_locations = []
+    location_lookup = {}
     valid_counters = []
     try:
         wb = get_spreadsheet()
-        valid_locations = sorted(get_valid_locations(wb))
+        location_lookup = get_valid_locations(wb)
+        valid_locations = sorted(set(location_lookup.values()))
         valid_counters = sorted(get_valid_counters(wb))
         sku_worksheet = wb.worksheet("SKU List")
         list_of_lists = sku_worksheet.get_all_values()
@@ -1004,6 +1063,7 @@ def home():
         HTML_TEMPLATE,
         sku_tree=sku_tree,
         valid_locations=valid_locations,
+        location_lookup=location_lookup,
         valid_counters=valid_counters,
     )
 
@@ -1071,36 +1131,37 @@ def submit():
                 "message": "Nama petugas tidak valid. Scan ID badge atau ketik nama yang benar.",
             }), 400
 
+        location_lookup = get_valid_locations(wb)
+        loc_string = resolve_location(data.get('location', ''), location_lookup)
+
+        if not location_lookup:
+            return jsonify({
+                "status": "error",
+                "message": "Daftar lokasi tidak tersedia. Periksa tab LOCATIONS di sheet.",
+            }), 400
+
+        if not loc_string:
+            raw = str(data.get('location', '')).strip()
+            return jsonify({
+                "status": "invalid_location",
+                "message": f"Lokasi tidak valid: {raw}. Scan QR lokasi yang benar.",
+            }), 400
+
         # --- FEATURE 1: REAL-TIME DUPLICATE DETECTOR INTERCEPTOR ---
         all_records = sheet.get_all_records()
         for row in all_records:
-            if (str(row.get("Precise Location")).strip() == str(data['location']).strip() and 
+            if (str(row.get("Precise Location")).strip() == loc_string and 
                 str(row.get("SKU Code")).strip() == str(data['sku']).strip() and 
                 get_row_counter_name(row) == counter_name):
                 
                 return jsonify({
                     "status": "duplicate",
                     "message": (
-                        f"Sudah tercatat: {data['sku']} di {data['location']} "
+                        f"Sudah tercatat: {data['sku']} di {loc_string} "
                         f"(jumlah {row.get('Physical Count')}). "
                         f"Ubah lewat Edit di tab Riwayat."
                     ),
                 }), 409
-        
-        valid_locations = get_valid_locations(wb)
-        loc_string = str(data['location']).strip()
-
-        if not valid_locations:
-            return jsonify({
-                "status": "error",
-                "message": "Daftar lokasi tidak tersedia. Periksa tab LOCATIONS di sheet.",
-            }), 400
-
-        if loc_string not in valid_locations:
-            return jsonify({
-                "status": "invalid_location",
-                "message": f"Lokasi tidak valid: {loc_string}. Scan QR lokasi yang benar.",
-            }), 400
 
         # Process standard row generation if duplicate test passes
         log_id = str(uuid.uuid4())[:8] 
