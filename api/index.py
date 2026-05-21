@@ -625,14 +625,14 @@ HTML_TEMPLATE = """
             const hint = document.getElementById('locationHint');
             const counterOk = isValidCounter(document.getElementById('counterName').value);
             if (!counterOk) {
-                if (hint) hint.textContent = 'Isi nama petugas dulu (scan badge atau ketik).';
-                locInput.placeholder = 'Belum di-scan';
+                if (hint) hint.textContent = 'Pastikan lokasi terscan dahulu sebelum scan produk.';
+                locInput.placeholder = 'Scan kode QR lokasi';
             } else if (locInput.value.trim()) {
                 if (hint) hint.textContent = 'Lokasi terisi. Tekan Scan untuk mengganti.';
                 locInput.placeholder = locInput.value;
             } else {
-                if (hint) hint.textContent = 'Tekan Scan untuk QR lokasi.';
-                locInput.placeholder = 'Belum di-scan';
+                if (hint) hint.textContent = 'Pastikan lokasi terscan dahulu sebelum scan produk.';
+                locInput.placeholder = 'Scan kode QR lokasi';
             }
         }
 
