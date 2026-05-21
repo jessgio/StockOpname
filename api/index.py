@@ -24,6 +24,51 @@ def get_spreadsheet():
     client = gspread.authorize(creds)
     return client.open("Aeris Beaute - Stock Opname Master Template")
 
+def get_valid_locations(wb):
+    """Return a set of allowed location codes from LOCATIONS column A."""
+    try:
+        ws = wb.worksheet("LOCATIONS")
+        col_a = ws.col_values(1)
+    except Exception:
+        return set()
+
+    locations = set()
+    header_names = {"location", "lokasi", "precise location", "locations", "kode lokasi"}
+    for i, val in enumerate(col_a):
+        loc = str(val).strip()
+        if not loc:
+            continue
+        if i == 0 and loc.lower() in header_names:
+            continue
+        locations.add(loc)
+    return locations
+
+def get_valid_counters(wb):
+    """Return a set of allowed counter names from COUNTERS column A."""
+    try:
+        ws = wb.worksheet("COUNTERS")
+        col_a = ws.col_values(1)
+    except Exception:
+        return set()
+
+    counters = set()
+    header_names = {
+        "counter", "counter name", "nama", "nama petugas", "petugas",
+        "name", "counters", "id badge", "badge",
+    }
+    for i, val in enumerate(col_a):
+        name = str(val).strip()
+        if not name:
+            continue
+        if i == 0 and name.lower() in header_names:
+            continue
+        counters.add(name)
+    return counters
+
+def get_row_counter_name(row):
+    """Read counter from new or legacy column header."""
+    return str(row.get("Counter Name") or row.get("Counter Team") or "").strip()
+
 # --- HTML INTERFACE WITH DUPLICATE PROTECTION & AUTO-RESET ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -42,26 +87,24 @@ HTML_TEMPLATE = """
         <div id="toastInner" class="rounded-xl px-4 py-3 text-sm font-medium shadow-lg border"></div>
     </div>
 
-    <!-- Sticky header: brand + team + location -->
+    <!-- Sticky header: brand + counter + location -->
     <header class="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-zinc-200 shadow-sm">
-        <div class="max-w-md lg:max-w-5xl mx-auto px-4 pt-3 pb-1">
+        <div class="max-w-md lg:max-w-5xl mx-auto px-4 pt-3 pb-3">
             <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Aeris Beaute</h1>
             <p class="text-xs text-zinc-500 mb-3">Stock Opname 2026</p>
-            <div class="flex gap-3 pb-3">
-                <div class="w-[7.5rem] shrink-0">
-                    <label for="counterTeam" class="block text-xs font-medium text-zinc-600 mb-1">Tim</label>
-                    <select id="counterTeam" onchange="fetchHistory()" class="w-full border border-zinc-200 text-sm font-medium rounded-lg px-2.5 py-2.5 bg-white focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
-                        <option value="Team 1">Team 1</option>
-                        <option value="Team 2">Team 2</option>
-                        <option value="Team 3">Team 3</option>
-                        <option value="Team 4">Team 4</option>
-                    </select>
+            <div class="space-y-3">
+                <div>
+                    <label for="counterName" class="block text-xs font-medium text-zinc-600 mb-1">Petugas</label>
+                    <div class="flex gap-2">
+                        <input type="text" id="counterName" autocomplete="off" onblur="onCounterNameInput()" placeholder="Scan ID badge atau ketik nama" class="flex-1 min-w-0 border border-amber-200 p-2.5 rounded-lg bg-amber-50 text-sm font-semibold text-amber-800 placeholder-amber-400/80 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                        <button type="button" onclick="openScanModal('counter')" class="shrink-0 px-3 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold transition">Scan</button>
+                    </div>
                 </div>
-                <div class="flex-1 min-w-0">
+                <div>
                     <label for="location" class="block text-xs font-medium text-zinc-600 mb-1">Lokasi</label>
                     <div class="flex gap-2">
-                        <input type="text" id="location" readonly placeholder="Scan lokasi" class="flex-1 min-w-0 border border-amber-200 p-2.5 rounded-lg bg-amber-50 font-mono text-sm font-semibold text-amber-800 placeholder-amber-400/80">
-                        <button type="button" onclick="openScanModal('location')" class="shrink-0 px-3 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold transition">Scan</button>
+                        <input type="text" id="location" readonly placeholder="Scan ID badge dulu" class="flex-1 min-w-0 border border-amber-200 p-2.5 rounded-lg bg-amber-50 font-mono text-sm font-semibold text-amber-800 placeholder-amber-400/80">
+                        <button type="button" id="scanLocationBtn" onclick="openScanModal('location')" disabled class="shrink-0 px-3 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold transition disabled:opacity-40 disabled:cursor-not-allowed">Scan</button>
                     </div>
                 </div>
             </div>
@@ -161,7 +204,7 @@ HTML_TEMPLATE = """
 
             <!-- History panel -->
             <div id="panelHistory" class="hidden lg:block">
-                <div class="bg-white rounded-xl border border-zinc-200 shadow-sm p-4 space-y-3 lg:sticky lg:top-36">
+                <div class="bg-white rounded-xl border border-zinc-200 shadow-sm p-4 space-y-3 lg:sticky lg:top-52">
                     <div class="flex justify-between items-center">
                         <h2 class="text-sm font-semibold text-zinc-800">Recent activity</h2>
                         <button type="button" onclick="fetchHistory()" class="text-sm font-medium text-violet-600 hover:text-violet-800">Refresh</button>
@@ -191,11 +234,15 @@ HTML_TEMPLATE = """
 
     <script>
         const skuTree = {{ sku_tree|tojson|safe }};
+        const validLocations = new Set({{ valid_locations|tojson|safe }});
+        const validCounters = new Set({{ valid_counters|tojson|safe }});
         let currentTarget = '';
         let scannerRunning = false;
         const html5QrcodeScanner = new Html5Qrcode("reader");
 
         const CLS = {
+            counterLocked: "flex-1 min-w-0 border border-amber-200 p-2.5 rounded-lg bg-amber-50 text-sm font-semibold text-amber-800 placeholder-amber-400/80 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none",
+            counterUnlocked: "flex-1 min-w-0 border border-emerald-200 p-2.5 rounded-lg bg-emerald-50 text-sm font-semibold text-emerald-800 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none",
             locLocked: "flex-1 min-w-0 border border-amber-200 p-2.5 rounded-lg bg-amber-50 font-mono text-sm font-semibold text-amber-800 placeholder-amber-400/80",
             locUnlocked: "flex-1 min-w-0 border border-emerald-200 p-2.5 rounded-lg bg-emerald-50 font-mono text-sm font-semibold text-emerald-800",
             selLocked: "w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 font-medium transition",
@@ -209,7 +256,7 @@ HTML_TEMPLATE = """
         };
 
         window.onload = () => {
-            fetchHistory();
+            lockAfterCounter();
             updateStepperUI();
             updateSubmitState();
             switchTab('count');
@@ -265,8 +312,18 @@ HTML_TEMPLATE = """
         }
 
         function updateStepperUI() {
+            const counterOk = isValidCounter(document.getElementById('counterName').value);
             const loc = document.getElementById('location').value.trim();
             const sku = document.getElementById('skuSelector').value;
+
+            if (!counterOk) {
+                setStepDot(1, 'pending');
+                setStepDot(2, 'pending');
+                setStepDot(3, 'pending');
+                setStepCardEnabled('step2Card', false);
+                setStepCardEnabled('step3Card', false);
+                return;
+            }
 
             if (!loc) {
                 setStepDot(1, 'active');
@@ -290,11 +347,68 @@ HTML_TEMPLATE = """
         }
 
         function updateSubmitState() {
-            const ready = document.getElementById('location').value.trim()
+            const ready = isValidCounter(document.getElementById('counterName').value)
+                && document.getElementById('location').value.trim()
                 && document.getElementById('skuSelector').value
                 && document.getElementById('count').value !== '';
             const btn = document.getElementById('submitBtn');
             btn.disabled = !ready || btn.dataset.loading === '1';
+        }
+
+        function isValidCounter(name) {
+            const trimmed = String(name).trim();
+            return trimmed && validCounters.has(trimmed);
+        }
+
+        function applyCounterScan(text) {
+            const trimmed = text.trim();
+            if (!validCounters.size) {
+                showToast('Daftar petugas belum dimuat. Hubungi admin.', 'error');
+                return false;
+            }
+            if (!isValidCounter(trimmed)) {
+                showToast('ID badge tidak dikenali. Scan badge yang benar atau ketik nama sesuai daftar.', 'warning');
+                return false;
+            }
+            document.getElementById('counterName').value = trimmed;
+            unlockAfterCounter();
+            return true;
+        }
+
+        function onCounterNameInput() {
+            if (isValidCounter(document.getElementById('counterName').value)) {
+                unlockAfterCounter();
+            } else {
+                lockAfterCounter();
+            }
+        }
+
+        function unlockAfterCounter() {
+            const counterInput = document.getElementById('counterName');
+            counterInput.className = CLS.counterUnlocked;
+            document.getElementById('scanLocationBtn').disabled = false;
+            const locInput = document.getElementById('location');
+            if (!locInput.value.trim()) {
+                locInput.placeholder = 'Scan lokasi';
+            }
+            updateStepperUI();
+            updateSubmitState();
+            fetchHistory();
+        }
+
+        function lockAfterCounter() {
+            const counterInput = document.getElementById('counterName');
+            if (!isValidCounter(counterInput.value)) {
+                counterInput.className = CLS.counterLocked;
+            }
+            document.getElementById('scanLocationBtn').disabled = true;
+            const locInput = document.getElementById('location');
+            locInput.placeholder = 'Scan ID badge dulu';
+            lockFormPostSubmit();
+            updateStepperUI();
+            updateSubmitState();
+            const container = document.getElementById('historyContainer');
+            container.innerHTML = '<p class="text-zinc-400 text-center py-8">Scan ID badge atau ketik nama petugas.</p>';
         }
 
         let toastTimer;
@@ -313,6 +427,30 @@ HTML_TEMPLATE = """
             toastTimer = setTimeout(() => {
                 toast.classList.add('translate-y-[-120%]', 'opacity-0', 'pointer-events-none');
             }, type === 'warning' ? 6000 : 3500);
+        }
+
+        function isValidLocation(code) {
+            const trimmed = code.trim();
+            return trimmed && validLocations.has(trimmed);
+        }
+
+        function applyLocationScan(text) {
+            if (!isValidCounter(document.getElementById('counterName').value)) {
+                showToast('Scan ID badge petugas dulu.', 'warning');
+                return false;
+            }
+            const trimmed = text.trim();
+            if (!validLocations.size) {
+                showToast('Daftar lokasi belum dimuat. Hubungi admin.', 'error');
+                return false;
+            }
+            if (!isValidLocation(trimmed)) {
+                showToast('Bukan kode lokasi valid. Scan QR lokasi, bukan SKU.', 'warning');
+                return false;
+            }
+            document.getElementById('location').value = trimmed;
+            unlockFormForLocation();
+            return true;
         }
 
         function unlockFormForLocation() {
@@ -406,11 +544,16 @@ HTML_TEMPLATE = """
         }
 
         async function openScanModal(target) {
+            if (target === 'location' && document.getElementById('scanLocationBtn').disabled) return;
             if (target === 'sku' && document.getElementById('scanSkuBtn').disabled) return;
 
             currentTarget = target;
-            document.getElementById('scanModalTitle').textContent =
-                target === 'location' ? 'Scan location QR' : 'Scan SKU QR';
+            const scanTitles = {
+                counter: 'Scan ID badge',
+                location: 'Scan location QR',
+                sku: 'Scan SKU QR',
+            };
+            document.getElementById('scanModalTitle').textContent = scanTitles[target] || 'Scan QR';
             document.getElementById('scanModal').classList.remove('hidden');
             document.body.classList.add('overflow-hidden');
 
@@ -424,9 +567,10 @@ HTML_TEMPLATE = """
                     { fps: 15, qrbox: { width: 250, height: 250 } },
                     async (decodedText) => {
                         const text = decodedText.trim();
-                        if (currentTarget === 'location') {
-                            document.getElementById('location').value = text;
-                            unlockFormForLocation();
+                        if (currentTarget === 'counter') {
+                            applyCounterScan(text);
+                        } else if (currentTarget === 'location') {
+                            applyLocationScan(text);
                         } else if (currentTarget === 'sku') {
                             let found = false;
                             for (const type in skuTree) {
@@ -490,16 +634,22 @@ HTML_TEMPLATE = """
         }
 
         async function fetchHistory() {
-            const team = document.getElementById('counterTeam').value;
+            const counterName = document.getElementById('counterName').value.trim();
             const container = document.getElementById('historyContainer');
+
+            if (!isValidCounter(counterName)) {
+                container.innerHTML = '<p class="text-zinc-400 text-center py-8">Scan ID badge atau ketik nama petugas.</p>';
+                return;
+            }
+
             container.innerHTML = '<p class="text-zinc-400 text-center py-8 animate-pulse">Loading…</p>';
 
             try {
-                const response = await fetch(`/history?team=${encodeURIComponent(team)}`);
+                const response = await fetch(`/history?name=${encodeURIComponent(counterName)}`);
                 const data = await response.json();
 
                 if (data.length === 0) {
-                    container.innerHTML = '<p class="text-zinc-400 text-center py-8">No records for this team yet.</p>';
+                    container.innerHTML = '<p class="text-zinc-400 text-center py-8">Belum ada catatan untuk petugas ini.</p>';
                     return;
                 }
 
@@ -512,7 +662,8 @@ HTML_TEMPLATE = """
                                     <span class="text-xl font-bold tabular-nums text-zinc-900 shrink-0">${escapeHtml(String(item.count))}</span>
                                 </div>
                                 <p class="text-sm font-medium text-zinc-700 truncate mt-0.5">${escapeHtml(item.sku)}</p>
-                                <p class="text-xs text-zinc-400 mt-0.5 truncate">${escapeHtml(item.notes || 'No notes')}</p>
+                                ${item.timestamp ? `<p class="text-xs text-zinc-400 mt-0.5">${escapeHtml(item.timestamp)}</p>` : ''}
+                                ${item.notes ? `<p class="text-xs text-zinc-500 mt-0.5 truncate">${escapeHtml(item.notes)}</p>` : ''}
                             </div>
                         </div>
                         <div class="flex gap-2 mt-2 pt-2 border-t border-zinc-100">
@@ -534,8 +685,20 @@ HTML_TEMPLATE = """
             const label = document.getElementById('submitBtnLabel');
             const spinner = document.getElementById('submitSpinner');
 
+            const counterName = document.getElementById('counterName').value.trim();
+
+            if (!isValidCounter(counterName)) {
+                showToast('Scan ID badge petugas dulu.', 'warning');
+                return;
+            }
+
             if (!locInput || !skuInput || countInput === '') {
                 showToast('Complete location, SKU, and count before submitting.', 'warning');
+                return;
+            }
+
+            if (!isValidLocation(locInput)) {
+                showToast('Lokasi tidak valid. Scan QR lokasi yang benar.', 'warning');
                 return;
             }
 
@@ -545,7 +708,7 @@ HTML_TEMPLATE = """
             spinner.classList.remove('hidden');
 
             const payload = {
-                team: document.getElementById('counterTeam').value,
+                counter_name: counterName,
                 location: locInput,
                 sku: skuInput,
                 count: countInput,
@@ -563,6 +726,8 @@ HTML_TEMPLATE = """
 
                 if (response.status === 409) {
                     showToast(result.message || 'Data duplikat. Gunakan Edit di Riwayat.', 'warning');
+                } else if (response.status === 400) {
+                    showToast(result.message || 'Lokasi tidak valid.', 'warning');
                 } else if (response.ok) {
                     showToast('Count saved successfully.', 'success');
                     document.getElementById('count').value = '0';
@@ -630,8 +795,12 @@ HTML_TEMPLATE = """
 @app.route('/')
 def home():
     sku_tree = {}
+    valid_locations = []
+    valid_counters = []
     try:
         wb = get_spreadsheet()
+        valid_locations = sorted(get_valid_locations(wb))
+        valid_counters = sorted(get_valid_counters(wb))
         sku_worksheet = wb.worksheet("SKU List")
         list_of_lists = sku_worksheet.get_all_values()
         
@@ -667,27 +836,33 @@ def home():
             }
         }
         
-    return render_template_string(HTML_TEMPLATE, sku_tree=sku_tree)
+    return render_template_string(
+        HTML_TEMPLATE,
+        sku_tree=sku_tree,
+        valid_locations=valid_locations,
+        valid_counters=valid_counters,
+    )
 
 @app.route('/history', methods=['GET'])
 def history():
     try:
-        target_team = request.args.get('team')
+        target_name = request.args.get('name', '').strip()
         wb = get_spreadsheet()
         sheet = wb.worksheet("Raw Counts")
         all_records = sheet.get_all_records()
         
-        team_data = [
+        counter_data = [
             {
                 "id": row.get("Log ID"),
                 "location": row.get("Precise Location"),
                 "sku": row.get("SKU Code"),
                 "count": row.get("Physical Count"),
-                "notes": row.get("Notes")
+                "timestamp": row.get("Timestamp"),
+                "notes": row.get("Notes") or ""
             }
-            for row in all_records if str(row.get("Counter Team")).strip() == target_team
+            for row in all_records if get_row_counter_name(row) == target_name
         ]
-        return jsonify(list(reversed(team_data))), 200
+        return jsonify(list(reversed(counter_data))), 200
     except Exception:
         return jsonify([]), 500
 
@@ -698,12 +873,27 @@ def submit():
         wb = get_spreadsheet()
         sheet = wb.worksheet("Raw Counts")
         
+        counter_name = str(data.get('counter_name', '')).strip()
+        valid_counters = get_valid_counters(wb)
+
+        if not valid_counters:
+            return jsonify({
+                "status": "error",
+                "message": "Daftar petugas tidak tersedia. Periksa tab COUNTERS di sheet.",
+            }), 400
+
+        if not counter_name or counter_name not in valid_counters:
+            return jsonify({
+                "status": "invalid_counter",
+                "message": "Nama petugas tidak valid. Scan ID badge atau ketik nama yang benar.",
+            }), 400
+
         # --- FEATURE 1: REAL-TIME DUPLICATE DETECTOR INTERCEPTOR ---
         all_records = sheet.get_all_records()
         for row in all_records:
             if (str(row.get("Precise Location")).strip() == str(data['location']).strip() and 
                 str(row.get("SKU Code")).strip() == str(data['sku']).strip() and 
-                str(row.get("Counter Team")).strip() == str(data['team']).strip()):
+                get_row_counter_name(row) == counter_name):
                 
                 return jsonify({
                     "status": "duplicate",
@@ -714,9 +904,23 @@ def submit():
                     ),
                 }), 409
         
+        valid_locations = get_valid_locations(wb)
+        loc_string = str(data['location']).strip()
+
+        if not valid_locations:
+            return jsonify({
+                "status": "error",
+                "message": "Daftar lokasi tidak tersedia. Periksa tab LOCATIONS di sheet.",
+            }), 400
+
+        if loc_string not in valid_locations:
+            return jsonify({
+                "status": "invalid_location",
+                "message": f"Lokasi tidak valid: {loc_string}. Scan QR lokasi yang benar.",
+            }), 400
+
         # Process standard row generation if duplicate test passes
         log_id = str(uuid.uuid4())[:8] 
-        loc_string = str(data['location']).strip()
         parts = loc_string.split('-')
         
         zone = parts[0] if len(parts) > 0 else loc_string[:1]
@@ -725,20 +929,21 @@ def submit():
         
         jakarta_tz = pytz.timezone('Asia/Jakarta')
         now_wib = datetime.now(jakarta_tz)
-        time_string = now_wib.strftime("[%d/%m/%Y %H:%M:%S]")
-        combined_notes = f"{time_string} {data['notes']}".strip()
+        timestamp = now_wib.strftime("%d/%m/%Y %H:%M:%S")
+        notes = data['notes'].strip()
         
         row_to_append = [
             log_id,              # Column A: Log ID
-            data['team'],        # Column B: Counter Team[cite: 1]
-            zone,                # Column C: Zone[cite: 1]
-            shelf,               # Column D: Shelf[cite: 1]
-            bin_code,            # Column E: Bin[cite: 1]
-            loc_string,          # Column F: Precise Location[cite: 1]
-            data['sku'],         # Column G: SKU Code[cite: 1]
-            "",                  # Column H: Item Name[cite: 1]
-            int(data['count']),  # Column I: Physical Count[cite: 1]
-            combined_notes       # Column J: Notes[cite: 1]
+            counter_name,        # Column B: Counter Name
+            zone,                # Column C: Zone
+            shelf,               # Column D: Shelf
+            bin_code,            # Column E: Bin
+            loc_string,          # Column F: Precise Location
+            data['sku'],         # Column G: SKU Code
+            "",                  # Column H: Item Name
+            int(data['count']),  # Column I: Physical Count
+            timestamp,           # Column J: Timestamp
+            notes                # Column K: Notes
         ]
         
         sheet.append_row(row_to_append)
