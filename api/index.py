@@ -6,7 +6,7 @@ from flask import Flask, render_template_string, request, jsonify
 import gspread
 from google.oauth2.service_account import Credentials
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
 app = Flask(__name__)
@@ -33,9 +33,11 @@ _SKU_LOOKUP_CACHE = {"payload": None, "expires": 0.0}
 _DUP_INDEX_CACHE = {}
 _SESSIONS_CACHE = {"sessions": None, "expires": 0.0}
 _HISTORY_CACHE = {}
+_DASHBOARD_CACHE = {"by_session": {}}
 _CACHE_LOCK = Lock()
 _SPREADSHEET_CACHE_TTL = int(os.environ.get("SPREADSHEET_CACHE_SECONDS", "300"))
 _SUMMARY_CACHE_TTL = int(os.environ.get("SUMMARY_CACHE_SECONDS", "30"))
+_DASHBOARD_CACHE_TTL = int(os.environ.get("DASHBOARD_CACHE_SECONDS", "20"))
 _LOOKUPS_CACHE_TTL = int(os.environ.get("LOOKUPS_CACHE_SECONDS", "300"))
 _DUP_INDEX_CACHE_TTL = int(os.environ.get("DUP_INDEX_CACHE_SECONDS", "120"))
 _HISTORY_CACHE_TTL = int(os.environ.get("HISTORY_CACHE_SECONDS", "60"))
@@ -88,11 +90,20 @@ def invalidate_summary_cache(session_id=None):
             _SUMMARY_CACHE["by_session"] = {}
             _SUMMARY_CACHE["expires"] = 0.0
 
+def invalidate_dashboard_cache(session_id=None):
+    with _CACHE_LOCK:
+        by_session = _DASHBOARD_CACHE.setdefault("by_session", {})
+        if session_id:
+            by_session.pop(session_id, None)
+        else:
+            _DASHBOARD_CACHE["by_session"] = {}
+
 def invalidate_count_caches(counter_name=None, session_id=None, invalidate_dup=True):
     if invalidate_dup:
         invalidate_dup_index_cache(session_id)
     invalidate_history_cache(counter_name, session_id)
     invalidate_summary_cache(session_id)
+    invalidate_dashboard_cache(session_id)
 
 def update_dup_index_entry(session_id, counter_name, loc_string, sku_code, count):
     """Keep duplicate index warm after append without re-reading the sheet."""
@@ -363,6 +374,143 @@ def build_summary_payload(session_id, force_refresh=False):
         _SUMMARY_CACHE["by_session"][session_id] = {
             "payload": payload,
             "expires": now + _SUMMARY_CACHE_TTL,
+        }
+    return payload, False
+
+def parse_opname_timestamp(ts_str):
+    try:
+        s = str(ts_str or "").strip()
+        if not s:
+            return None
+        return datetime.strptime(s, "%d/%m/%Y %H:%M:%S")
+    except Exception:
+        return None
+
+def read_session_count_rows(sheet, session_id):
+    """Fetch counter, location, SKU, qty, timestamp, session for dashboard metrics."""
+    try:
+        batch = sheet.batch_get(["B2:B", "F2:H", "I2:I", "K2:K"])
+        counters_col = batch[0] if batch else []
+        detail_col = batch[1] if len(batch) > 1 else []
+        time_col = batch[2] if len(batch) > 2 else []
+        session_col = batch[3] if len(batch) > 3 else []
+    except Exception:
+        return []
+
+    row_count = max(len(counters_col), len(detail_col), len(time_col), len(session_col))
+    rows = []
+    for i in range(row_count):
+        s_row = session_col[i] if i < len(session_col) else []
+        row_session = str(s_row[0] if s_row else "").strip()
+        if session_id and row_session != session_id:
+            continue
+        c_row = counters_col[i] if i < len(counters_col) else []
+        d_row = detail_col[i] if i < len(detail_col) else []
+        t_row = time_col[i] if i < len(time_col) else []
+        d_padded = list(d_row) + ["", "", ""]
+        rows.append({
+            "counter": str(c_row[0] if c_row else "").strip(),
+            "location": str(d_padded[0]).strip(),
+            "sku": str(d_padded[1]).strip(),
+            "qty": parse_physical_count(d_padded[2]),
+            "timestamp": str(t_row[0] if t_row else "").strip(),
+        })
+    return rows
+
+def build_dashboard_payload(session_id, force_refresh=False):
+    now = time.time()
+    if not force_refresh:
+        with _CACHE_LOCK:
+            entry = _DASHBOARD_CACHE.get("by_session", {}).get(session_id)
+            if entry is not None and now < entry.get("expires", 0):
+                return entry["payload"], True
+
+    wb = get_spreadsheet_cached()
+    lookups, _ = build_lookups_payload()
+    sku_payload, _ = build_sku_payload()
+    sessions, _ = build_sessions_payload()
+    session_meta = session_by_id(sessions, session_id)
+
+    location_lookup = lookups["location_lookup"]
+    sku_lookup = sku_payload["sku_lookup"]
+    valid_locations = set(location_lookup.values())
+    valid_skus = set(sku_lookup.values())
+    locations_total = len(valid_locations)
+    skus_total = len(valid_skus)
+
+    sheet = wb.worksheet("Raw Counts")
+    rows = read_session_count_rows(sheet, session_id)
+
+    unique_locations = set()
+    unique_skus = set()
+    unique_counters = set()
+    sku_line_counts = {}
+    total_qty = 0
+    hourly = {}
+    jakarta_tz = pytz.timezone("Asia/Jakarta")
+    recent_cutoff = datetime.now(jakarta_tz) - timedelta(minutes=15)
+    recent_entries = 0
+
+    for row in rows:
+        total_qty += row["qty"]
+        counter = row["counter"]
+        if counter:
+            unique_counters.add(counter)
+
+        loc = resolve_location(row["location"], location_lookup) or row["location"]
+        if loc and loc in valid_locations:
+            unique_locations.add(loc)
+
+        sku = resolve_sku(row["sku"], sku_lookup) or row["sku"]
+        if sku and sku in valid_skus:
+            unique_skus.add(sku)
+            sku_line_counts[sku] = sku_line_counts.get(sku, 0) + 1
+
+        ts = parse_opname_timestamp(row["timestamp"])
+        if ts:
+            if ts.tzinfo is None:
+                ts = jakarta_tz.localize(ts)
+            hour_key = ts.strftime("%H:00")
+            hourly[hour_key] = hourly.get(hour_key, 0) + 1
+            if ts >= recent_cutoff:
+                recent_entries += 1
+
+    locations_covered = len(unique_locations)
+    skus_covered = len(unique_skus)
+    top_skus = sorted(
+        [{"sku": k, "lines": v} for k, v in sku_line_counts.items()],
+        key=lambda x: (-x["lines"], x["sku"]),
+    )[:10]
+    hourly_sorted = sorted(
+        [{"hour": h, "entries": hourly[h]} for h in hourly],
+        key=lambda x: x["hour"],
+    )
+
+    payload = {
+        "session_id": session_id,
+        "session_name": session_meta["name"] if session_meta else session_id,
+        "updated_at": datetime.now(jakarta_tz).strftime("%d/%m/%Y %H:%M:%S"),
+        "locations": {
+            "covered": locations_covered,
+            "total": locations_total,
+            "pct": round(100 * locations_covered / locations_total, 1) if locations_total else 0,
+        },
+        "skus": {
+            "covered": skus_covered,
+            "total": skus_total,
+            "pct": round(100 * skus_covered / skus_total, 1) if skus_total else 0,
+        },
+        "entries": len(rows),
+        "total_qty": total_qty,
+        "counters_active": len(unique_counters),
+        "recent_entries": recent_entries,
+        "top_skus": top_skus,
+        "hourly": hourly_sorted,
+    }
+    with _CACHE_LOCK:
+        _DASHBOARD_CACHE.setdefault("by_session", {})[session_id] = {
+            "payload": payload,
+            "expires": now + _DASHBOARD_CACHE_TTL,
         }
     return payload, False
 
@@ -683,7 +831,8 @@ SESSION_HTML_TEMPLATE = """
             <p id="continueLabel" class="font-semibold text-violet-950 mt-1"></p>
             <div class="flex gap-2 mt-3">
                 <a href="/count" class="flex-1 text-center py-2.5 rounded-lg bg-violet-600 text-white text-sm font-semibold">Ke halaman Count</a>
-                <button type="button" onclick="endStoredSession()" class="px-3 py-2.5 rounded-lg border border-violet-300 text-violet-800 text-sm font-semibold">End Session</button>
+                <a href="/dashboard" class="px-3 py-2.5 rounded-lg border border-violet-300 text-violet-800 text-sm font-semibold text-center">Dashboard</a>
+                <button type="button" onclick="endStoredSession()" class="px-3 py-2.5 rounded-lg border border-zinc-300 text-zinc-700 text-sm font-semibold">End Session</button>
             </div>
         </div>
         <div class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
@@ -924,8 +1073,9 @@ HTML_TEMPLATE = """
                         <p class="text-xs text-zinc-500">Stock Opname 2026</p>
                     </div>
                     <nav class="flex flex-col items-end gap-1 text-xs font-semibold shrink-0">
-                        <div class="flex gap-3">
+                        <div class="flex flex-wrap gap-3 justify-end">
                             <span class="text-violet-700">Count</span>
+                            <a href="/dashboard" class="text-zinc-500 hover:text-violet-700">Dashboard</a>
                             <a href="/summary" class="text-zinc-500 hover:text-violet-700">Summary</a>
                         </div>
                         <p id="sessionBadge" class="text-[10px] text-zinc-500 max-w-[10rem] truncate"></p>
@@ -2267,6 +2417,273 @@ HTML_TEMPLATE = """
 </html>
 """
 
+DASHBOARD_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Opname Dashboard — Aeris Beaute</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        @keyframes pulse-live { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+        .live-dot { animation: pulse-live 2s ease-in-out infinite; }
+        .metric-card { transition: transform 0.2s ease, box-shadow 0.2s ease; }
+        .metric-card:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgb(0 0 0 / 0.08); }
+        .progress-ring { transform: rotate(-90deg); transform-origin: 50% 50%; }
+    </style>
+</head>
+<body class="bg-zinc-50 font-sans text-zinc-900 antialiased min-h-screen">
+    <header class="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-zinc-200 shadow-sm">
+        <div class="max-w-6xl mx-auto px-4 py-3">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                    <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Opname Dashboard</h1>
+                    <p id="dashSubtitle" class="text-xs text-zinc-500">Memuat…</p>
+                </div>
+                <nav class="flex flex-col items-end gap-1 text-xs font-semibold shrink-0">
+                    <div class="flex flex-wrap gap-3 justify-end">
+                        <a href="/count" class="text-zinc-500 hover:text-violet-700">Count</a>
+                        <span class="text-violet-700">Dashboard</span>
+                        <a href="/summary" class="text-zinc-500 hover:text-violet-700">Summary</a>
+                    </div>
+                    <p id="dashSessionBadge" class="text-[10px] text-zinc-500 max-w-[12rem] truncate"></p>
+                    <button type="button" onclick="endSession()" class="text-[10px] text-rose-600 hover:text-rose-800 font-semibold">End Session</button>
+                </nav>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-6xl mx-auto px-4 py-5 space-y-5">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="flex items-center gap-2 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-full px-3 py-1.5">
+                <span class="live-dot inline-block h-2 w-2 rounded-full bg-emerald-500"></span>
+                <span id="liveLabel">Live · refresh 20s</span>
+            </div>
+            <button type="button" onclick="loadDashboard(true)" class="text-sm font-semibold text-violet-700 hover:text-violet-900 px-3 py-1.5 rounded-lg border border-violet-200 bg-violet-50">Refresh now</button>
+        </div>
+
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <div class="metric-card col-span-2 lg:col-span-1 bg-white rounded-xl border border-zinc-200 p-4 shadow-sm">
+                <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Lokasi tercover</p>
+                <p class="text-3xl font-bold text-violet-700 mt-1 tabular-nums" id="metricLocPct">—</p>
+                <p class="text-sm text-zinc-600 mt-0.5" id="metricLocFrac">— / —</p>
+                <div class="mt-3 h-2 rounded-full bg-zinc-100 overflow-hidden">
+                    <div id="barLoc" class="h-full bg-violet-500 rounded-full transition-all duration-700" style="width:0%"></div>
+                </div>
+            </div>
+            <div class="metric-card col-span-2 lg:col-span-1 bg-white rounded-xl border border-zinc-200 p-4 shadow-sm">
+                <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">SKU tercover</p>
+                <p class="text-3xl font-bold text-indigo-700 mt-1 tabular-nums" id="metricSkuPct">—</p>
+                <p class="text-sm text-zinc-600 mt-0.5" id="metricSkuFrac">— / —</p>
+                <div class="mt-3 h-2 rounded-full bg-zinc-100 overflow-hidden">
+                    <div id="barSku" class="h-full bg-indigo-500 rounded-full transition-all duration-700" style="width:0%"></div>
+                </div>
+            </div>
+            <div class="metric-card bg-white rounded-xl border border-zinc-200 p-4 shadow-sm">
+                <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Baris entri</p>
+                <p class="text-2xl font-bold text-zinc-900 mt-1 tabular-nums" id="metricEntries">—</p>
+                <p class="text-xs text-zinc-500 mt-1"><span id="metricRecent">0</span> dalam 15 menit</p>
+            </div>
+            <div class="metric-card bg-white rounded-xl border border-zinc-200 p-4 shadow-sm">
+                <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Total qty</p>
+                <p class="text-2xl font-bold text-zinc-900 mt-1 tabular-nums" id="metricQty">—</p>
+                <p class="text-xs text-zinc-500 mt-1"><span id="metricCounters">0</span> petugas aktif</p>
+            </div>
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-4">
+            <div class="bg-white rounded-xl border border-zinc-200 p-4 shadow-sm">
+                <h2 class="text-sm font-semibold text-zinc-800 mb-3">Cakupan lokasi</h2>
+                <div class="h-56 flex items-center justify-center"><canvas id="chartLocations"></canvas></div>
+            </div>
+            <div class="bg-white rounded-xl border border-zinc-200 p-4 shadow-sm">
+                <h2 class="text-sm font-semibold text-zinc-800 mb-3">Cakupan SKU</h2>
+                <div class="h-56 flex items-center justify-center"><canvas id="chartSkus"></canvas></div>
+            </div>
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-4">
+            <div class="bg-white rounded-xl border border-zinc-200 p-4 shadow-sm">
+                <h2 class="text-sm font-semibold text-zinc-800 mb-3">Aktivitas per jam (hari ini)</h2>
+                <div class="h-56"><canvas id="chartHourly"></canvas></div>
+            </div>
+            <div class="bg-white rounded-xl border border-zinc-200 p-4 shadow-sm">
+                <h2 class="text-sm font-semibold text-zinc-800 mb-3">Top SKU (jumlah baris)</h2>
+                <div class="h-56"><canvas id="chartTopSku"></canvas></div>
+            </div>
+        </div>
+        <p id="dashUpdated" class="text-xs text-zinc-400 text-center pb-6"></p>
+    </main>
+
+    <script>
+        const SESSION_STORAGE_KEY = 'aeris_opname_session';
+        const POLL_MS = 20000;
+        let charts = {};
+        let pollTimer = null;
+
+        function loadStoredSession() {
+            try {
+                const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+                return raw ? JSON.parse(raw) : null;
+            } catch (e) { return null; }
+        }
+
+        function endSession() {
+            localStorage.removeItem(SESSION_STORAGE_KEY);
+            window.location.href = '/';
+        }
+
+        const activeSession = loadStoredSession();
+        if (!activeSession || !activeSession.sessionId) {
+            window.location.replace('/');
+        }
+
+        function fmt(n) {
+            return Number(n).toLocaleString('id-ID');
+        }
+
+        function upsertDoughnut(id, labels, values, colors) {
+            const ctx = document.getElementById(id);
+            if (!ctx) return;
+            if (charts[id]) {
+                charts[id].data.labels = labels;
+                charts[id].data.datasets[0].data = values;
+                charts[id].update('active');
+                return;
+            }
+            charts[id] = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels,
+                    datasets: [{ data: values, backgroundColor: colors, borderWidth: 0 }],
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    cutout: '62%',
+                    plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } } },
+                },
+            });
+        }
+
+        function upsertBar(id, labels, values, color) {
+            const ctx = document.getElementById(id);
+            if (!ctx) return;
+            if (charts[id]) {
+                charts[id].data.labels = labels;
+                charts[id].data.datasets[0].data = values;
+                charts[id].update('active');
+                return;
+            }
+            charts[id] = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels,
+                    datasets: [{ data: values, backgroundColor: color, borderRadius: 6 }],
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { ticks: { font: { size: 10 }, maxRotation: 45, minRotation: 0 } },
+                        y: { beginAtZero: true, ticks: { precision: 0 } },
+                    },
+                },
+            });
+        }
+
+        function upsertLine(id, labels, values) {
+            const ctx = document.getElementById(id);
+            if (!ctx) return;
+            if (charts[id]) {
+                charts[id].data.labels = labels;
+                charts[id].data.datasets[0].data = values;
+                charts[id].update('active');
+                return;
+            }
+            charts[id] = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [{
+                        data: values,
+                        borderColor: '#7c3aed',
+                        backgroundColor: 'rgba(124, 58, 237, 0.12)',
+                        fill: true,
+                        tension: 0.35,
+                        pointRadius: 3,
+                    }],
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: { beginAtZero: true, ticks: { precision: 0 } },
+                    },
+                },
+            });
+        }
+
+        function renderDashboard(d) {
+            document.getElementById('dashSubtitle').textContent = 'Monitoring sesi · ' + (d.session_name || d.session_id);
+            document.getElementById('dashSessionBadge').textContent = d.session_name || d.session_id;
+
+            const loc = d.locations || {};
+            const sku = d.skus || {};
+            document.getElementById('metricLocPct').textContent = loc.pct + '%';
+            document.getElementById('metricLocFrac').textContent = fmt(loc.covered) + ' / ' + fmt(loc.total);
+            document.getElementById('barLoc').style.width = Math.min(100, loc.pct || 0) + '%';
+
+            document.getElementById('metricSkuPct').textContent = sku.pct + '%';
+            document.getElementById('metricSkuFrac').textContent = fmt(sku.covered) + ' / ' + fmt(sku.total);
+            document.getElementById('barSku').style.width = Math.min(100, sku.pct || 0) + '%';
+
+            document.getElementById('metricEntries').textContent = fmt(d.entries || 0);
+            document.getElementById('metricRecent').textContent = fmt(d.recent_entries || 0);
+            document.getElementById('metricQty').textContent = fmt(d.total_qty || 0);
+            document.getElementById('metricCounters').textContent = fmt(d.counters_active || 0);
+
+            const locRemain = Math.max(0, (loc.total || 0) - (loc.covered || 0));
+            const skuRemain = Math.max(0, (sku.total || 0) - (sku.covered || 0));
+            upsertDoughnut('chartLocations', ['Tercover', 'Belum'], [loc.covered || 0, locRemain], ['#8b5cf6', '#e4e4e7']);
+            upsertDoughnut('chartSkus', ['Tercover', 'Belum'], [sku.covered || 0, skuRemain], ['#6366f1', '#e4e4e7']);
+
+            const hourly = d.hourly || [];
+            upsertLine('chartHourly', hourly.map(h => h.hour), hourly.map(h => h.entries));
+
+            const top = d.top_skus || [];
+            upsertBar('chartTopSku', top.map(t => t.sku), top.map(t => t.lines), '#a78bfa');
+
+            document.getElementById('dashUpdated').textContent = 'Diperbarui: ' + (d.updated_at || '—');
+        }
+
+        async function loadDashboard(forceRefresh = false) {
+            try {
+                const qs = new URLSearchParams({ session_id: activeSession.sessionId });
+                if (forceRefresh) qs.set('refresh', '1');
+                const res = await fetch('/dashboard/data?' + qs.toString());
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || 'load failed');
+                renderDashboard(data);
+            } catch (e) {
+                document.getElementById('dashSubtitle').textContent = 'Gagal memuat dashboard';
+            }
+        }
+
+        loadDashboard();
+        pollTimer = setInterval(() => loadDashboard(false), POLL_MS);
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') loadDashboard(false);
+        });
+    </script>
+</body>
+</html>
+"""
+
 SUMMARY_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -2286,8 +2703,9 @@ SUMMARY_HTML_TEMPLATE = """
                     <p class="text-xs text-zinc-500">Running totals from Raw Counts</p>
                 </div>
                 <nav class="flex flex-col items-end gap-1 text-xs font-semibold shrink-0">
-                    <div class="flex gap-3">
+                    <div class="flex flex-wrap gap-3 justify-end">
                         <a href="/count" class="text-zinc-500 hover:text-violet-700">Count</a>
+                        <a href="/dashboard" class="text-zinc-500 hover:text-violet-700">Dashboard</a>
                         <span class="text-violet-700">Summary</span>
                     </div>
                     <p id="summarySessionBadge" class="text-[10px] text-zinc-500 max-w-[10rem] truncate"></p>
@@ -2509,6 +2927,27 @@ def api_lookups():
             "warnings": [],
             "error": str(e),
         }), 500
+
+@app.route('/dashboard')
+def dashboard_page():
+    return render_template_string(DASHBOARD_HTML_TEMPLATE)
+
+@app.route('/dashboard/data')
+def dashboard_data():
+    try:
+        session_id = request.args.get("session_id", "").strip()
+        if not session_id:
+            return jsonify({"error": "session_id required"}), 400
+        if not require_valid_session_id(session_id):
+            return jsonify({"error": "Invalid session"}), 400
+        force_refresh = request.args.get("refresh") in ("1", "true", "yes")
+        payload, from_cache = build_dashboard_payload(session_id, force_refresh=force_refresh)
+        response = jsonify(payload)
+        if from_cache and not force_refresh:
+            response.headers["Cache-Control"] = f"private, max-age={_DASHBOARD_CACHE_TTL}"
+        return response, 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/summary')
 def summary_page():
