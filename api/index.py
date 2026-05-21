@@ -1,5 +1,7 @@
 import os
 import json
+import time
+from threading import Lock
 from flask import Flask, render_template_string, request, jsonify
 import gspread
 from google.oauth2.service_account import Credentials
@@ -25,6 +27,66 @@ def get_spreadsheet():
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     client = gspread.authorize(creds)
     return client.open("Aeris Beaute - Stock Opname Master Template")
+
+_SPREADSHEET_CACHE = {"wb": None, "expires": 0.0}
+_SUMMARY_CACHE = {"payload": None, "expires": 0.0}
+_CACHE_LOCK = Lock()
+_SPREADSHEET_CACHE_TTL = int(os.environ.get("SPREADSHEET_CACHE_SECONDS", "300"))
+_SUMMARY_CACHE_TTL = int(os.environ.get("SUMMARY_CACHE_SECONDS", "30"))
+
+def get_spreadsheet_cached():
+    now = time.time()
+    with _CACHE_LOCK:
+        if _SPREADSHEET_CACHE["wb"] is not None and now < _SPREADSHEET_CACHE["expires"]:
+            return _SPREADSHEET_CACHE["wb"]
+    wb = get_spreadsheet()
+    with _CACHE_LOCK:
+        _SPREADSHEET_CACHE["wb"] = wb
+        _SPREADSHEET_CACHE["expires"] = now + _SPREADSHEET_CACHE_TTL
+    return wb
+
+def invalidate_summary_cache():
+    with _CACHE_LOCK:
+        _SUMMARY_CACHE["payload"] = None
+        _SUMMARY_CACHE["expires"] = 0.0
+
+def read_raw_counts_for_summary(sheet):
+    """Fetch only location, SKU, and qty columns (F–H) instead of the full sheet."""
+    try:
+        values = sheet.get("F2:H")
+    except Exception:
+        return []
+    records = []
+    for row in values:
+        padded = list(row) + ["", "", ""]
+        records.append({
+            "Precise Location": padded[0],
+            "SKU Code": padded[1],
+            "Physical Count": padded[2],
+        })
+    return records
+
+def build_summary_payload(force_refresh=False):
+    now = time.time()
+    if not force_refresh:
+        with _CACHE_LOCK:
+            cached = _SUMMARY_CACHE["payload"]
+            if cached is not None and now < _SUMMARY_CACHE["expires"]:
+                return cached, True
+
+    wb = get_spreadsheet_cached()
+    sheet = wb.worksheet("Raw Counts")
+    records = read_raw_counts_for_summary(sheet)
+    rows, grand_total = aggregate_counts_by_sku(records)
+    payload = {
+        "rows": rows,
+        "grand_total": grand_total,
+        "sku_count": len(rows),
+    }
+    with _CACHE_LOCK:
+        _SUMMARY_CACHE["payload"] = payload
+        _SUMMARY_CACHE["expires"] = now + _SUMMARY_CACHE_TTL
+    return payload, False
 
 COUNTER_PREFIXES = (
     "counter:", "counter name:", "name:", "nama:", "nama petugas:",
@@ -1688,7 +1750,7 @@ SUMMARY_HTML_TEMPLATE = """
         <div class="flex flex-col sm:flex-row sm:items-center gap-3">
             <input type="search" id="searchSku" placeholder="Cari SKU…" oninput="filterTable()"
                 class="flex-1 border border-zinc-200 rounded-lg px-3 py-2.5 text-sm focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
-            <button type="button" onclick="loadSummary()" class="shrink-0 px-4 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-sm font-semibold transition">
+            <button type="button" onclick="loadSummary(true)" class="shrink-0 px-4 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-sm font-semibold transition">
                 Refresh
             </button>
         </div>
@@ -1762,12 +1824,13 @@ SUMMARY_HTML_TEMPLATE = """
             renderTable(filtered, grand);
         }
 
-        async function loadSummary() {
+        async function loadSummary(forceRefresh = false) {
             const body = document.getElementById('summaryBody');
             body.innerHTML = '<tr><td colspan="3" class="px-4 py-8 text-center text-zinc-400 animate-pulse">Loading…</td></tr>';
 
             try {
-                const res = await fetch('/summary/data');
+                const url = forceRefresh ? '/summary/data?refresh=1' : '/summary/data';
+                const res = await fetch(url);
                 const data = await res.json();
                 summaryRows = data.rows || [];
                 renderTable(summaryRows, data.grand_total || 0);
@@ -1880,15 +1943,12 @@ def summary_page():
 @app.route('/summary/data')
 def summary_data():
     try:
-        wb = get_spreadsheet()
-        sheet = wb.worksheet("Raw Counts")
-        records = sheet.get_all_records()
-        rows, grand_total = aggregate_counts_by_sku(records)
-        return jsonify({
-            "rows": rows,
-            "grand_total": grand_total,
-            "sku_count": len(rows),
-        }), 200
+        force_refresh = request.args.get("refresh") in ("1", "true", "yes")
+        payload, from_cache = build_summary_payload(force_refresh=force_refresh)
+        response = jsonify(payload)
+        if from_cache and not force_refresh:
+            response.headers["Cache-Control"] = f"private, max-age={_SUMMARY_CACHE_TTL}"
+        return response, 200
     except Exception as e:
         return jsonify({"rows": [], "grand_total": 0, "sku_count": 0, "error": str(e)}), 500
 
@@ -2028,6 +2088,7 @@ def submit():
         ]
         
         sheet.append_row(row_to_append)
+        invalidate_summary_cache()
         return jsonify({"status": "success"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -2045,6 +2106,7 @@ def edit():
         
         if cell:
             sheet.update_cell(cell.row, 8, new_count)  # Column H: Physical Count
+            invalidate_summary_cache()
             return jsonify({"status": "success"}), 200
         return jsonify({"status": "error", "message": "Record row not found"}), 404
     except Exception as e:
@@ -2062,6 +2124,7 @@ def delete():
         
         if cell:
             sheet.delete_rows(cell.row)
+            invalidate_summary_cache()
             return jsonify({"status": "success"}), 200
         return jsonify({"status": "error", "message": "Record row not found"}), 404
     except Exception as e:
