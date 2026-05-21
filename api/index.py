@@ -32,10 +32,16 @@ _SPREADSHEET_CACHE = {"wb": None, "expires": 0.0}
 _SUMMARY_CACHE = {"payload": None, "expires": 0.0}
 _LOOKUPS_CACHE = {"payload": None, "expires": 0.0}
 _SKU_TREE_CACHE = {"tree": None, "expires": 0.0}
+_DUP_INDEX_CACHE = {"index": None, "expires": 0.0}
+_HISTORY_CACHE = {}
 _CACHE_LOCK = Lock()
 _SPREADSHEET_CACHE_TTL = int(os.environ.get("SPREADSHEET_CACHE_SECONDS", "300"))
 _SUMMARY_CACHE_TTL = int(os.environ.get("SUMMARY_CACHE_SECONDS", "30"))
 _LOOKUPS_CACHE_TTL = int(os.environ.get("LOOKUPS_CACHE_SECONDS", "300"))
+_DUP_INDEX_CACHE_TTL = int(os.environ.get("DUP_INDEX_CACHE_SECONDS", "120"))
+_HISTORY_CACHE_TTL = int(os.environ.get("HISTORY_CACHE_SECONDS", "60"))
+HISTORY_SCAN_ROWS = int(os.environ.get("HISTORY_SCAN_ROWS", "6000"))
+HISTORY_MAX_ITEMS = int(os.environ.get("HISTORY_MAX_ITEMS", "300"))
 
 def get_spreadsheet_cached():
     now = time.time()
@@ -53,6 +59,32 @@ def invalidate_summary_cache():
         _SUMMARY_CACHE["payload"] = None
         _SUMMARY_CACHE["expires"] = 0.0
 
+def invalidate_dup_index_cache():
+    with _CACHE_LOCK:
+        _DUP_INDEX_CACHE["index"] = None
+        _DUP_INDEX_CACHE["expires"] = 0.0
+
+def invalidate_history_cache(counter_name=None):
+    with _CACHE_LOCK:
+        if counter_name:
+            _HISTORY_CACHE.pop(counter_name, None)
+        else:
+            _HISTORY_CACHE.clear()
+
+def invalidate_count_caches(counter_name=None, invalidate_dup=True):
+    if invalidate_dup:
+        invalidate_dup_index_cache()
+    invalidate_history_cache(counter_name)
+    invalidate_summary_cache()
+
+def update_dup_index_entry(counter_name, loc_string, sku_code, count):
+    """Keep duplicate index warm after append without re-reading the sheet."""
+    with _CACHE_LOCK:
+        idx = _DUP_INDEX_CACHE["index"]
+        if idx is None:
+            return
+        idx[(counter_name, loc_string, sku_code)] = count
+
 def read_raw_counts_for_summary(sheet):
     """Fetch only location, SKU, and qty columns (F–H) instead of the full sheet."""
     try:
@@ -69,26 +101,119 @@ def read_raw_counts_for_summary(sheet):
         })
     return records
 
-def read_raw_count_rows(sheet):
-    """Fetch Raw Counts data rows (A–J) without get_all_records overhead."""
+def _row_dict_from_padded(padded):
+    return {
+        "Log ID": padded[0],
+        "Counter Name": padded[1],
+        "Counter Team": "",
+        "Precise Location": padded[5],
+        "SKU Code": padded[6],
+        "Physical Count": padded[7],
+        "Timestamp": padded[8],
+        "Notes": padded[9],
+    }
+
+def read_raw_count_rows(sheet, start_row=2, end_row=None):
+    """Fetch Raw Counts rows (A–J) for a row range."""
+    if end_row is None:
+        end_row = sheet.row_count
+    if end_row < start_row:
+        return []
     try:
-        values = sheet.get("A2:J")
+        values = sheet.get(f"A{start_row}:J{end_row}")
     except Exception:
         return []
     rows = []
     for row in values:
         padded = list(row) + [""] * 10
-        rows.append({
-            "Log ID": padded[0],
-            "Counter Name": padded[1],
-            "Counter Team": "",
-            "Precise Location": padded[5],
-            "SKU Code": padded[6],
-            "Physical Count": padded[7],
-            "Timestamp": padded[8],
-            "Notes": padded[9],
-        })
+        rows.append(_row_dict_from_padded(padded))
     return rows
+
+def get_dup_index(sheet, force_refresh=False):
+    """Map (counter, location, sku) -> qty; built from columns B and F–H only."""
+    now = time.time()
+    if not force_refresh:
+        with _CACHE_LOCK:
+            cached = _DUP_INDEX_CACHE["index"]
+            if cached is not None and now < _DUP_INDEX_CACHE["expires"]:
+                return cached
+
+    index = {}
+    try:
+        batch = sheet.batch_get(["B2:B", "F2:H"])
+        counters_col = batch[0] if batch else []
+        detail_col = batch[1] if len(batch) > 1 else []
+    except Exception:
+        try:
+            counters_col = sheet.get("B2:B")
+            detail_col = sheet.get("F2:H")
+        except Exception:
+            counters_col, detail_col = [], []
+
+    counters_col = counters_col or []
+    detail_col = detail_col or []
+    row_count = max(len(counters_col), len(detail_col))
+    for i in range(row_count):
+        c_row = counters_col[i] if i < len(counters_col) else []
+        d_row = detail_col[i] if i < len(detail_col) else []
+        counter = str(c_row[0] if c_row else "").strip()
+        d_padded = list(d_row) + ["", "", ""]
+        loc = str(d_padded[0]).strip()
+        sku = str(d_padded[1]).strip()
+        if counter and loc and sku:
+            index[(counter, loc, sku)] = d_padded[2]
+
+    with _CACHE_LOCK:
+        _DUP_INDEX_CACHE["index"] = index
+        _DUP_INDEX_CACHE["expires"] = now + _DUP_INDEX_CACHE_TTL
+    return index
+
+def _history_item_from_row(row):
+    return {
+        "id": row.get("Log ID"),
+        "location": row.get("Precise Location"),
+        "sku": row.get("SKU Code"),
+        "count": row.get("Physical Count"),
+        "timestamp": row.get("Timestamp"),
+        "notes": row.get("Notes") or "",
+    }
+
+def fetch_counter_history(sheet, target_name, counter_lookup, force_refresh=False, full_scan=False):
+    """Return recent history for one counter without reading the entire sheet."""
+    now = time.time()
+    if not force_refresh and not full_scan:
+        with _CACHE_LOCK:
+            entry = _HISTORY_CACHE.get(target_name)
+            if entry is not None and now < entry["expires"]:
+                return entry["items"], entry.get("truncated", False), True
+
+    if full_scan:
+        rows = read_raw_count_rows(sheet)
+        truncated = False
+    else:
+        row_count = sheet.row_count
+        start_row = max(2, row_count - HISTORY_SCAN_ROWS + 1)
+        rows = read_raw_count_rows(sheet, start_row=start_row, end_row=row_count)
+        truncated = start_row > 2
+
+    matches = [
+        _history_item_from_row(row)
+        for row in rows
+        if row_matches_counter(row, target_name, counter_lookup)
+    ]
+    if len(matches) > HISTORY_MAX_ITEMS:
+        truncated = True
+        matches = matches[-HISTORY_MAX_ITEMS:]
+
+    items = list(reversed(matches))
+    if not full_scan:
+        with _CACHE_LOCK:
+            _HISTORY_CACHE[target_name] = {
+                "items": items,
+                "truncated": truncated,
+                "expires": now + _HISTORY_CACHE_TTL,
+            }
+    return items, truncated, False
 
 def build_lookups_payload(force_refresh=False):
     now = time.time()
@@ -132,20 +257,10 @@ def row_matches_counter(row, target_name, counter_lookup):
         return True
     return resolve_counter(row_name, counter_lookup) == target_name
 
-def find_duplicate_count_row(sheet, counter_name, loc_string, sku_code):
-    """Scan counter/location/SKU/qty columns (B, F–H) for an existing count."""
-    try:
-        values = sheet.get("B2:H")
-    except Exception:
-        return None
-    for row in values:
-        padded = list(row) + ["", "", "", "", "", "", ""]
-        row_counter = str(padded[0]).strip()
-        row_location = str(padded[4]).strip()
-        row_sku = str(padded[5]).strip()
-        if row_location == loc_string and row_sku == sku_code and row_counter == counter_name:
-            return padded[6]
-    return None
+def find_duplicate_count(sheet, counter_name, loc_string, sku_code):
+    """O(1) duplicate lookup using a cached index of counter/location/SKU keys."""
+    index = get_dup_index(sheet)
+    return index.get((counter_name, loc_string, sku_code))
 
 def build_summary_payload(force_refresh=False):
     now = time.time()
@@ -679,7 +794,7 @@ HTML_TEMPLATE = """
                 <div class="step-card opname-history-sticky lg:sticky">
                     <div class="step-card__head step-card__head--idle">
                         <h2 class="step-card__title step-card__title--idle flex-1">Riwayat</h2>
-                        <button type="button" onclick="fetchHistory()" class="text-sm font-semibold text-violet-600 hover:text-violet-800">Refresh</button>
+                        <button type="button" onclick="fetchHistory(true)" class="text-sm font-semibold text-violet-600 hover:text-violet-800">Refresh</button>
                     </div>
                     <div id="historyContainer" class="p-4 pt-2 space-y-2 max-h-[calc(100vh-12rem)] overflow-y-auto text-sm">
                         <p class="text-zinc-400 text-center py-8">Memuat riwayat…</p>
@@ -1056,7 +1171,7 @@ HTML_TEMPLATE = """
                     lockSkuFields();
                     locInput.className = CLS.locLocked;
                 }
-                if (refreshHistory) fetchHistory();
+                if (refreshHistory) maybeFetchHistory();
             } else {
                 counterInput.className = CLS.counterLocked;
                 counterInput.removeAttribute('readonly');
@@ -1145,7 +1260,7 @@ HTML_TEMPLATE = """
             resetPageInteractionState();
             bindScanButtons();
             showLookupWarnings(lookupWarnings);
-            await syncUIState({ refreshHistory: true });
+            await syncUIState({ refreshHistory: false });
             syncTopChromeLayout();
             window.addEventListener('resize', () => {
                 if (locationFrozen) syncTopChromeLayout();
@@ -1187,9 +1302,24 @@ HTML_TEMPLATE = """
                 : 'flex-1 py-2 text-sm font-semibold rounded-md bg-white text-zinc-900 shadow-sm transition';
             tabCount.setAttribute('aria-selected', showCount);
             tabHistory.setAttribute('aria-selected', !showCount);
+            if (!showCount) maybeFetchHistory();
         }
 
-        window.addEventListener('resize', () => switchTab(document.getElementById('tabHistory').getAttribute('aria-selected') === 'true' ? 'history' : 'count'));
+        function isHistoryPanelVisible() {
+            return window.matchMedia('(min-width: 1024px)').matches
+                || document.getElementById('tabHistory').getAttribute('aria-selected') === 'true';
+        }
+
+        function maybeFetchHistory(forceRefresh = false) {
+            if (!isHistoryPanelVisible()) return;
+            if (!isValidCounter(document.getElementById('counterName').value)) return;
+            fetchHistory(forceRefresh);
+        }
+
+        window.addEventListener('resize', () => {
+            switchTab(document.getElementById('tabHistory').getAttribute('aria-selected') === 'true' ? 'history' : 'count');
+            maybeFetchHistory();
+        });
 
         function setStepCardVisual(cardId, active) {
             const card = document.getElementById(cardId);
@@ -1317,7 +1447,8 @@ HTML_TEMPLATE = """
             }
             document.getElementById('counterName').value = resolved;
             unlockAfterCounter();
-            await syncUIState({ refreshHistory: true });
+            await syncUIState({ refreshHistory: false });
+            maybeFetchHistory();
             return true;
         }
 
@@ -1329,7 +1460,7 @@ HTML_TEMPLATE = """
 
             if (!trimmed) {
                 lastCounterNameToast = '';
-                await syncUIState({ refreshHistory: true });
+                await syncUIState({ refreshHistory: false });
                 return;
             }
 
@@ -1360,7 +1491,8 @@ HTML_TEMPLATE = """
                     counterInput.value = resolved;
                 }
             }
-            await syncUIState({ refreshHistory: isCommit && !!resolved });
+            await syncUIState({ refreshHistory: false });
+            if (isCommit && resolved) maybeFetchHistory();
         }
 
         function unlockAfterCounter() {
@@ -1640,7 +1772,7 @@ HTML_TEMPLATE = """
                 .replace(/"/g, '&quot;');
         }
 
-        async function fetchHistory() {
+        async function fetchHistory(forceRefresh = false) {
             // #region agent log
             _dbgHistoryCalls += 1;
             dbgLog('H3', 'fetchHistory', 'called', { callCount: _dbgHistoryCalls });
@@ -1656,15 +1788,19 @@ HTML_TEMPLATE = """
             container.innerHTML = '<p class="text-zinc-400 text-center py-8 animate-pulse">Memuat…</p>';
 
             try {
-                const response = await fetch(`/history?name=${encodeURIComponent(counterName)}`);
-                const data = await response.json();
+                const qs = new URLSearchParams({ name: counterName });
+                if (forceRefresh) qs.set('refresh', '1');
+                const response = await fetch(`/history?${qs.toString()}`);
+                const payload = await response.json();
+                const data = Array.isArray(payload) ? payload : (payload.items || []);
+                const truncated = !Array.isArray(payload) && !!payload.truncated;
 
                 if (data.length === 0) {
                     container.innerHTML = '<p class="text-zinc-400 text-center py-8">Belum ada catatan untuk petugas ini.</p>';
                     return;
                 }
 
-                container.innerHTML = data.map(item => `
+                const rowsHtml = data.map(item => `
                     <div class="border border-zinc-100 rounded-lg p-3 hover:bg-zinc-50/80 transition">
                         <div class="flex justify-between items-start gap-2">
                             <div class="min-w-0 flex-1">
@@ -1683,6 +1819,10 @@ HTML_TEMPLATE = """
                         </div>
                     </div>
                 `).join('');
+                const truncNote = truncated
+                    ? '<p class="text-xs text-amber-700 text-center py-2 px-2">Menampilkan entri terbaru saja. Ketuk Refresh jika perlu memuat ulang.</p>'
+                    : '';
+                container.innerHTML = rowsHtml + truncNote;
             } catch (err) {
                 container.innerHTML = '<p class="text-rose-600 text-center py-8">Failed to load history.</p>';
             }
@@ -1742,7 +1882,7 @@ HTML_TEMPLATE = """
                     dbgLog('H3', 'submitData:ok', 'submit success', { locationFrozen, loc: document.getElementById('location').value });
                     // #endregion
                     resetSkuAndCount();
-                    fetchHistory();
+                    maybeFetchHistory(true);
                 } else {
                     showToast('Sync failed. Try again.', 'error');
                 }
@@ -1767,7 +1907,7 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ id: logId, count: parseInt(newCount) })
                 });
                 if (response.ok) {
-                    fetchHistory();
+                    maybeFetchHistory(true);
                 } else {
                     alert('Failed to update record on sheet.');
                 }
@@ -1786,7 +1926,7 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ id: logId })
                 });
                 if (response.ok) {
-                    fetchHistory();
+                    maybeFetchHistory(true);
                 } else {
                     alert('Failed to delete record from sheet.');
                 }
@@ -2025,27 +2165,29 @@ def summary_data():
 def history():
     try:
         raw_name = request.args.get('name', '').strip()
+        if not raw_name:
+            return jsonify({"items": [], "truncated": False}), 200
+
+        force_refresh = request.args.get("refresh") in ("1", "true", "yes")
+        full_scan = request.args.get("full") in ("1", "true", "yes")
         lookups, _ = build_lookups_payload()
         counter_lookup = lookups["counter_lookup"]
         target_name = resolve_counter(raw_name, counter_lookup) or raw_name
         wb = get_spreadsheet_cached()
         sheet = wb.worksheet("Raw Counts")
-        all_records = read_raw_count_rows(sheet)
-
-        counter_data = [
-            {
-                "id": row.get("Log ID"),
-                "location": row.get("Precise Location"),
-                "sku": row.get("SKU Code"),
-                "count": row.get("Physical Count"),
-                "timestamp": row.get("Timestamp"),
-                "notes": row.get("Notes") or ""
-            }
-            for row in all_records if row_matches_counter(row, target_name, counter_lookup)
-        ]
-        return jsonify(list(reversed(counter_data))), 200
+        items, truncated, from_cache = fetch_counter_history(
+            sheet,
+            target_name,
+            counter_lookup,
+            force_refresh=force_refresh,
+            full_scan=full_scan,
+        )
+        response = jsonify({"items": items, "truncated": truncated})
+        if from_cache and not force_refresh:
+            response.headers["Cache-Control"] = f"private, max-age={_HISTORY_CACHE_TTL}"
+        return response, 200
     except Exception:
-        return jsonify([]), 500
+        return jsonify({"items": [], "truncated": False}), 500
 
 @app.route('/submit', methods=['POST'])
 def submit():
@@ -2101,7 +2243,7 @@ def submit():
                 "message": f"SKU tidak valid: {raw_sku}. Pilih atau scan SKU dari daftar.",
             }), 400
 
-        dup_count = find_duplicate_count_row(sheet, counter_name, loc_string, sku_code)
+        dup_count = find_duplicate_count(sheet, counter_name, loc_string, sku_code)
         if dup_count is not None:
             return jsonify({
                 "status": "duplicate",
@@ -2146,7 +2288,9 @@ def submit():
         ]
         
         sheet.append_row(row_to_append)
+        invalidate_history_cache(counter_name)
         invalidate_summary_cache()
+        update_dup_index_entry(counter_name, loc_string, sku_code, physical_count)
         return jsonify({"status": "success"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -2164,7 +2308,7 @@ def edit():
         
         if cell:
             sheet.update_cell(cell.row, 8, new_count)  # Column H: Physical Count
-            invalidate_summary_cache()
+            invalidate_count_caches(invalidate_dup=True)
             return jsonify({"status": "success"}), 200
         return jsonify({"status": "error", "message": "Record row not found"}), 404
     except Exception as e:
@@ -2182,7 +2326,7 @@ def delete():
         
         if cell:
             sheet.delete_rows(cell.row)
-            invalidate_summary_cache()
+            invalidate_count_caches()
             return jsonify({"status": "success"}), 200
         return jsonify({"status": "error", "message": "Record row not found"}), 404
     except Exception as e:
