@@ -42,21 +42,28 @@ HTML_TEMPLATE = """
         <div id="toastInner" class="rounded-xl px-4 py-3 text-sm font-medium shadow-lg border"></div>
     </div>
 
-    <!-- Sticky header -->
-    <header class="sticky top-0 z-40 bg-white/90 backdrop-blur-md border-b border-zinc-200">
-        <div class="max-w-md lg:max-w-5xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
-            <div class="min-w-0">
-                <h1 class="text-lg font-bold text-zinc-900 tracking-tight truncate">Aeris Beaute</h1>
-                <p class="text-xs text-zinc-500">Stock Opname 2026</p>
-            </div>
-            <div class="shrink-0 w-36">
-                <label for="counterTeam" class="sr-only">Counter team</label>
-                <select id="counterTeam" onchange="fetchHistory()" class="w-full border border-zinc-200 text-sm font-medium rounded-lg px-3 py-2 bg-white focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
-                    <option value="Team 1">Team 1</option>
-                    <option value="Team 2">Team 2</option>
-                    <option value="Team 3">Team 3</option>
-                    <option value="Team 4">Team 4</option>
-                </select>
+    <!-- Sticky header: brand + team + location -->
+    <header class="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-zinc-200 shadow-sm">
+        <div class="max-w-md lg:max-w-5xl mx-auto px-4 pt-3 pb-1">
+            <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Aeris Beaute</h1>
+            <p class="text-xs text-zinc-500 mb-3">Stock Opname 2026</p>
+            <div class="flex gap-3 pb-3">
+                <div class="w-[7.5rem] shrink-0">
+                    <label for="counterTeam" class="block text-xs font-medium text-zinc-600 mb-1">Tim</label>
+                    <select id="counterTeam" onchange="fetchHistory()" class="w-full border border-zinc-200 text-sm font-medium rounded-lg px-2.5 py-2.5 bg-white focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                        <option value="Team 1">Team 1</option>
+                        <option value="Team 2">Team 2</option>
+                        <option value="Team 3">Team 3</option>
+                        <option value="Team 4">Team 4</option>
+                    </select>
+                </div>
+                <div class="flex-1 min-w-0">
+                    <label for="location" class="block text-xs font-medium text-zinc-600 mb-1">Lokasi</label>
+                    <div class="flex gap-2">
+                        <input type="text" id="location" readonly placeholder="Scan lokasi" class="flex-1 min-w-0 border border-amber-200 p-2.5 rounded-lg bg-amber-50 font-mono text-sm font-semibold text-amber-800 placeholder-amber-400/80">
+                        <button type="button" onclick="openScanModal('location')" class="shrink-0 px-3 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold transition">Scan</button>
+                    </div>
+                </div>
             </div>
         </div>
     </header>
@@ -91,23 +98,6 @@ HTML_TEMPLATE = """
 
             <!-- Count panel -->
             <div id="panelCount" class="space-y-4">
-
-                <!-- Step 1: Location -->
-                <section id="step1Card" class="bg-white rounded-xl border border-zinc-200 shadow-sm overflow-hidden">
-                    <div class="flex items-center gap-3 px-4 py-3 border-b border-zinc-100 bg-zinc-50/80">
-                        <span class="text-xs font-semibold text-violet-600 bg-violet-50 px-2 py-0.5 rounded">Step 1</span>
-                        <h2 class="text-sm font-semibold text-zinc-800">Location</h2>
-                    </div>
-                    <div class="p-4 space-y-3">
-                        <button type="button" onclick="openScanModal('location')" class="w-full py-3 px-4 rounded-lg bg-violet-600 hover:bg-violet-700 text-white font-semibold text-sm transition shadow-sm">
-                            Scan location QR
-                        </button>
-                        <div>
-                            <label for="location" class="block text-sm font-medium text-zinc-600 mb-1">Precise location</label>
-                            <input type="text" id="location" readonly placeholder="Scan location QR to unlock" class="w-full border border-amber-200 p-3 rounded-lg bg-amber-50 font-mono text-sm font-semibold text-amber-800 placeholder-amber-400/80">
-                        </div>
-                    </div>
-                </section>
 
                 <!-- Step 2: Product -->
                 <section id="step2Card" class="bg-white rounded-xl border border-zinc-200 shadow-sm overflow-hidden opacity-60 pointer-events-none transition" aria-disabled="true">
@@ -171,7 +161,7 @@ HTML_TEMPLATE = """
 
             <!-- History panel -->
             <div id="panelHistory" class="hidden lg:block">
-                <div class="bg-white rounded-xl border border-zinc-200 shadow-sm p-4 space-y-3 lg:sticky lg:top-20">
+                <div class="bg-white rounded-xl border border-zinc-200 shadow-sm p-4 space-y-3 lg:sticky lg:top-36">
                     <div class="flex justify-between items-center">
                         <h2 class="text-sm font-semibold text-zinc-800">Recent activity</h2>
                         <button type="button" onclick="fetchHistory()" class="text-sm font-medium text-violet-600 hover:text-violet-800">Refresh</button>
@@ -206,8 +196,8 @@ HTML_TEMPLATE = """
         const html5QrcodeScanner = new Html5Qrcode("reader");
 
         const CLS = {
-            locLocked: "w-full border border-amber-200 p-3 rounded-lg bg-amber-50 font-mono text-sm font-semibold text-amber-800 placeholder-amber-400/80",
-            locUnlocked: "w-full border border-emerald-200 p-3 rounded-lg bg-emerald-50 font-mono text-sm font-semibold text-emerald-800",
+            locLocked: "flex-1 min-w-0 border border-amber-200 p-2.5 rounded-lg bg-amber-50 font-mono text-sm font-semibold text-amber-800 placeholder-amber-400/80",
+            locUnlocked: "flex-1 min-w-0 border border-emerald-200 p-2.5 rounded-lg bg-emerald-50 font-mono text-sm font-semibold text-emerald-800",
             selLocked: "w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 font-medium transition",
             selUnlocked: "w-full border border-zinc-200 p-3 rounded-lg bg-white text-zinc-900 font-medium focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none transition",
         };
@@ -347,7 +337,7 @@ HTML_TEMPLATE = """
             const locInput = document.getElementById('location');
             locInput.value = '';
             locInput.className = CLS.locLocked;
-            locInput.placeholder = 'Scan location QR to unlock';
+            locInput.placeholder = 'Scan lokasi';
 
             document.getElementById('scanSkuBtn').disabled = true;
 
@@ -572,7 +562,7 @@ HTML_TEMPLATE = """
                 const result = await response.json();
 
                 if (response.status === 409) {
-                    showToast(result.message || 'Duplicate entry blocked.', 'warning');
+                    showToast(result.message || 'Data duplikat. Gunakan Edit di Riwayat.', 'warning');
                 } else if (response.ok) {
                     showToast('Count saved successfully.', 'success');
                     document.getElementById('count').value = '0';
@@ -717,7 +707,11 @@ def submit():
                 
                 return jsonify({
                     "status": "duplicate",
-                    "message": f"Your team already recorded SKU [{data['sku']}] at location [{data['location']}] with an entry of {row.get('Physical Count')} units.\\n\\nTo modify this quantity, scroll down to your 'Recent Activity' log below, click 'Edit' on that record, and update the value instead of creating a duplicate line item."
+                    "message": (
+                        f"Sudah tercatat: {data['sku']} di {data['location']} "
+                        f"(jumlah {row.get('Physical Count')}). "
+                        f"Ubah lewat Edit di tab Riwayat."
+                    ),
                 }), 409
         
         # Process standard row generation if duplicate test passes
@@ -731,7 +725,7 @@ def submit():
         
         jakarta_tz = pytz.timezone('Asia/Jakarta')
         now_wib = datetime.now(jakarta_tz)
-        time_string = now_wib.strftime("[%H:%M:%S]")
+        time_string = now_wib.strftime("[%d/%m/%Y %H:%M:%S]")
         combined_notes = f"{time_string} {data['notes']}".strip()
         
         row_to_append = [
