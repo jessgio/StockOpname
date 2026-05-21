@@ -847,19 +847,27 @@ HTML_TEMPLATE = """
         body.opname-location-locked #historyContainer {
             max-height: calc(100vh - var(--opname-chrome-h, 7.25rem) - 6rem);
         }
-        .sku-field-wrap { position: relative; }
+        /* Step 3: allow SKU autocomplete to paint over Step 4+ (step-card defaults to overflow:hidden) */
+        #step3Card.step-card {
+            overflow: visible;
+            position: relative;
+        }
+        #step3Card.step-card.sku-suggest-open {
+            z-index: 45;
+        }
+        .sku-field-wrap { position: relative; z-index: 1; }
         #skuSuggestions {
             position: absolute;
             left: 0;
             right: 0;
             top: calc(100% + 4px);
-            z-index: 30;
+            z-index: 50;
             max-height: 12rem;
             overflow-y: auto;
             border-radius: 0.5rem;
             border: 1px solid #e4e4e7;
             background: #fff;
-            box-shadow: 0 4px 12px rgb(0 0 0 / 0.1);
+            box-shadow: 0 8px 24px rgb(0 0 0 / 0.12);
         }
         #skuSuggestions.hidden { display: none !important; }
         #skuSuggestions li {
@@ -1244,6 +1252,8 @@ HTML_TEMPLATE = """
             const box = document.getElementById('skuSuggestions');
             box.classList.add('hidden');
             box.innerHTML = '';
+            const step3 = document.getElementById('step3Card');
+            if (step3) step3.classList.remove('sku-suggest-open');
         }
 
         function filterSkuSuggestions(query) {
@@ -1269,6 +1279,8 @@ HTML_TEMPLATE = """
                 `<li role="option" tabindex="-1"${i === 0 ? ' aria-selected="true"' : ''}>${escapeHtml(sku)}</li>`
             ).join('');
             box.classList.remove('hidden');
+            const step3 = document.getElementById('step3Card');
+            if (step3) step3.classList.add('sku-suggest-open');
             box.querySelectorAll('li').forEach((li, i) => {
                 li.addEventListener('mousedown', (e) => {
                     e.preventDefault();
