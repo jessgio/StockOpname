@@ -31,7 +31,7 @@ def get_spreadsheet():
 _SPREADSHEET_CACHE = {"wb": None, "expires": 0.0}
 _SUMMARY_CACHE = {"by_session": {}, "expires": 0.0}
 _LOOKUPS_CACHE = {"payload": None, "expires": 0.0}
-_SKU_TREE_CACHE = {"tree": None, "expires": 0.0}
+_SKU_LOOKUP_CACHE = {"payload": None, "expires": 0.0}
 _DUP_INDEX_CACHE = {}
 _SESSIONS_CACHE = {"sessions": None, "expires": 0.0}
 _HISTORY_CACHE = {}
@@ -272,18 +272,51 @@ def build_lookups_payload(force_refresh=False):
         _LOOKUPS_CACHE["expires"] = now + _LOOKUPS_CACHE_TTL
     return payload, False
 
-def load_sku_tree_cached(wb, force_refresh=False):
+def get_valid_skus(wb):
+    """Build SKU lookup from SKU List tab (SKU Code column)."""
+    try:
+        sku_worksheet = wb.worksheet("SKU List")
+        list_of_lists = sku_worksheet.get_all_values()
+    except Exception:
+        return {}, []
+
+    if not list_of_lists:
+        return {}, []
+
+    headers = list_of_lists[0]
+    sku_idx = headers.index("SKU Code") if "SKU Code" in headers else 0
+    codes = []
+    for row in list_of_lists[1:]:
+        if len(row) <= sku_idx:
+            continue
+        sku_code = str(row[sku_idx]).strip()
+        if sku_code:
+            codes.append(sku_code)
+    return build_lookup(codes, "SKU LIST", "any")
+
+def build_sku_payload(force_refresh=False):
     now = time.time()
     if not force_refresh:
         with _CACHE_LOCK:
-            cached = _SKU_TREE_CACHE["tree"]
-            if cached is not None and now < _SKU_TREE_CACHE["expires"]:
-                return cached
-    tree = load_sku_tree(wb)
+            cached = _SKU_LOOKUP_CACHE.get("payload")
+            if cached is not None and now < _SKU_LOOKUP_CACHE.get("expires", 0):
+                return cached, True
+
+    wb = get_spreadsheet_cached()
+    sku_lookup, sku_warnings = get_valid_skus(wb)
+    payload = {
+        "sku_lookup": sku_lookup,
+        "sku_codes": sorted(set(sku_lookup.values())),
+        "warnings": sku_warnings,
+    }
     with _CACHE_LOCK:
-        _SKU_TREE_CACHE["tree"] = tree
-        _SKU_TREE_CACHE["expires"] = now + _LOOKUPS_CACHE_TTL
-    return tree
+        _SKU_LOOKUP_CACHE["payload"] = payload
+        _SKU_LOOKUP_CACHE["expires"] = now + _LOOKUPS_CACHE_TTL
+    return payload, False
+
+def load_sku_lookup_cached(wb, force_refresh=False):
+    payload, _ = build_sku_payload(force_refresh=force_refresh)
+    return payload["sku_lookup"]
 
 def row_matches_counter(row, target_name, counter_lookup):
     row_name = get_row_counter_name(row)
@@ -574,49 +607,20 @@ def require_valid_session_id(session_id):
     sessions, _ = build_sessions_payload()
     return session_by_id(sessions, session_id)
 
-def load_sku_tree(wb):
-    """Build nested SKU tree from SKU List worksheet."""
-    sku_tree = {}
-    try:
-        sku_worksheet = wb.worksheet("SKU List")
-        list_of_lists = sku_worksheet.get_all_values()
-        if len(list_of_lists) > 1:
-            headers = list_of_lists[0]
-            sku_idx = headers.index("SKU Code") if "SKU Code" in headers else 0
-            type_idx = headers.index("SKU Type") if "SKU Type" in headers else 1
-            cat_idx = headers.index("SKU Category") if "SKU Category" in headers else 2
-            for row in list_of_lists[1:]:
-                if len(row) <= max(sku_idx, type_idx, cat_idx):
-                    continue
-                sku_code = str(row[sku_idx]).strip()
-                goods_type = str(row[type_idx]).strip() or "General Goods"
-                category = str(row[cat_idx]).strip() or "Unassigned"
-                if not sku_code:
-                    continue
-                if goods_type not in sku_tree:
-                    sku_tree[goods_type] = {}
-                if category not in sku_tree[goods_type]:
-                    sku_tree[goods_type][category] = []
-                if sku_code not in sku_tree[goods_type][category]:
-                    sku_tree[goods_type][category].append(sku_code)
-    except Exception:
-        pass
-    return sku_tree
-
-def resolve_sku(code, sku_tree):
-    """Match scanned or submitted SKU to a code in the SKU tree."""
-    if not code or not sku_tree:
+def resolve_sku(code, sku_lookup):
+    """Match scanned or typed SKU to a canonical code in the SKU lookup."""
+    if not code or not sku_lookup:
         return None
     trimmed = str(code).strip()
-    for goods_type in sku_tree.values():
-        for skus in goods_type.values():
-            if trimmed in skus:
-                return trimmed
-            key = normalize_scan_text(trimmed).lower()
-            for sku in skus:
-                if normalize_scan_text(sku).lower() == key:
-                    return sku
-    return None
+    if trimmed in sku_lookup.values():
+        return trimmed
+    key = normalize_scan_text(trimmed).lower()
+    if key and key in sku_lookup:
+        return sku_lookup[key]
+    plain = " ".join(trimmed.lower().split())
+    if plain and plain in sku_lookup:
+        return sku_lookup[plain]
+    return sku_lookup.get(key)
 
 def get_row_counter_name(row):
     """Read counter from new or legacy column header."""
@@ -843,6 +847,32 @@ HTML_TEMPLATE = """
         body.opname-location-locked #historyContainer {
             max-height: calc(100vh - var(--opname-chrome-h, 7.25rem) - 6rem);
         }
+        .sku-field-wrap { position: relative; }
+        #skuSuggestions {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: calc(100% + 4px);
+            z-index: 30;
+            max-height: 12rem;
+            overflow-y: auto;
+            border-radius: 0.5rem;
+            border: 1px solid #e4e4e7;
+            background: #fff;
+            box-shadow: 0 4px 12px rgb(0 0 0 / 0.1);
+        }
+        #skuSuggestions.hidden { display: none !important; }
+        #skuSuggestions li {
+            padding: 0.625rem 0.75rem;
+            font-size: 0.875rem;
+            font-weight: 600;
+            font-family: ui-monospace, monospace;
+            color: #5b21b6;
+            cursor: pointer;
+        }
+        #skuSuggestions li:hover, #skuSuggestions li[aria-selected="true"] {
+            background: rgb(245 243 255);
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
 </head>
@@ -981,26 +1011,19 @@ HTML_TEMPLATE = """
                         <h2 class="step-card__title step-card__title--idle">Produk</h2>
                     </div>
                     <div class="p-4 space-y-3">
-                        <button type="button" id="scanSkuBtn" onclick="openScanModal('sku')" disabled class="w-full py-3 px-4 rounded-lg border-2 border-zinc-200 text-zinc-500 font-semibold text-sm transition disabled:opacity-50 disabled:cursor-not-allowed enabled:border-violet-300 enabled:text-violet-700 enabled:bg-violet-50 enabled:hover:bg-violet-100">
-                            Scan SKU
-                        </button>
-                        <div>
-                            <label for="skuType" class="block text-sm font-medium text-zinc-700 mb-1">Jenis barang</label>
-                            <select id="skuType" onchange="updateCategories()" disabled class="w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 text-sm font-medium focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
-                                <option value="">Scan lokasi dulu</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label for="skuCategory" class="block text-sm font-medium text-zinc-700 mb-1">Kategori</label>
-                            <select id="skuCategory" onchange="updateSkus()" disabled class="w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 text-sm font-medium focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
-                                <option value="">Pilih jenis dulu</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label for="skuSelector" class="block text-sm font-medium text-zinc-700 mb-1">Kode SKU</label>
-                            <select id="skuSelector" onchange="updateStepperUI(); updateSubmitState();" disabled class="w-full border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 text-sm font-medium focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
-                                <option value="">Pilih kategori dulu</option>
-                            </select>
+                        <div class="sku-field-wrap">
+                            <label for="skuInput" class="block text-sm font-medium text-zinc-700 mb-1.5">Kode SKU</label>
+                            <div class="flex gap-2">
+                                <input type="text" id="skuInput" autocomplete="off" disabled
+                                    placeholder="Scan lokasi dulu"
+                                    class="opname-field flex-1 min-w-0 border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                                <button type="button" id="scanSkuBtn" onclick="openScanModal('sku')" disabled
+                                    class="shrink-0 px-4 py-3 rounded-lg bg-violet-600 hover:bg-violet-700 active:bg-violet-800 text-white text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed">
+                                    Scan
+                                </button>
+                            </div>
+                            <ul id="skuSuggestions" class="hidden" role="listbox" aria-label="Saran SKU"></ul>
+                            <p id="skuHint" class="text-xs text-zinc-500 mt-2">Ketik untuk saran otomatis atau scan QR SKU.</p>
                         </div>
                     </div>
                 </section>
@@ -1106,7 +1129,12 @@ HTML_TEMPLATE = """
                 return {};
             }
         })();
-        const skuTree = _boot.sku_tree || {};
+        let skuLookup = {};
+        let skuCodes = [];
+        let skuIndexLoaded = false;
+        let skuIndexLoading = null;
+        let skuSuggestTimer = null;
+        const SKU_SUGGEST_MAX = 20;
         let locationLookup = _boot.location_lookup || {};
         let counterLookup = _boot.counter_lookup || {};
         let lookupWarnings = _boot.lookup_warnings || [];
@@ -1177,17 +1205,156 @@ HTML_TEMPLATE = """
 
         function resolveSku(code) {
             const trimmed = String(code || '').trim();
-            if (!trimmed) return null;
-            for (const type in skuTree) {
-                for (const cat in skuTree[type]) {
-                    if (skuTree[type][cat].includes(trimmed)) return trimmed;
-                    const key = normalizeScanText(trimmed).toLowerCase();
-                    for (const sku of skuTree[type][cat]) {
-                        if (normalizeScanText(sku).toLowerCase() === key) return sku;
+            if (!trimmed || !Object.keys(skuLookup).length) return null;
+            if (Object.values(skuLookup).includes(trimmed)) return trimmed;
+            const key = normalizeScanText(trimmed).toLowerCase();
+            if (key && skuLookup[key]) return skuLookup[key];
+            const plain = trimmed.toLowerCase().replace(/\\s+/g, ' ');
+            if (plain && skuLookup[plain]) return skuLookup[plain];
+            return null;
+        }
+
+        async function ensureSkuIndex() {
+            if (skuIndexLoaded) return true;
+            if (skuIndexLoading) return skuIndexLoading;
+            skuIndexLoading = (async () => {
+                try {
+                    const res = await fetch('/api/sku-codes');
+                    if (!res.ok) throw new Error('fetch failed');
+                    const data = await res.json();
+                    skuLookup = data.sku_lookup || {};
+                    skuCodes = data.sku_codes || [];
+                    if (data.warnings && data.warnings.length) {
+                        lookupWarnings = lookupWarnings.concat(data.warnings);
+                        showLookupWarnings(lookupWarnings);
                     }
+                    skuIndexLoaded = true;
+                    return true;
+                } catch (e) {
+                    showToast('Daftar SKU gagal dimuat. Periksa tab SKU List.', 'error');
+                    return false;
+                } finally {
+                    skuIndexLoading = null;
+                }
+            })();
+            return skuIndexLoading;
+        }
+
+        function hideSkuSuggestions() {
+            const box = document.getElementById('skuSuggestions');
+            box.classList.add('hidden');
+            box.innerHTML = '';
+        }
+
+        function filterSkuSuggestions(query) {
+            const q = String(query || '').trim().toLowerCase();
+            if (!q || !skuCodes.length) return [];
+            const matches = [];
+            for (const code of skuCodes) {
+                if (code.toLowerCase().includes(q)) {
+                    matches.push(code);
+                    if (matches.length >= SKU_SUGGEST_MAX) break;
                 }
             }
-            return null;
+            return matches;
+        }
+
+        function renderSkuSuggestions(matches) {
+            const box = document.getElementById('skuSuggestions');
+            if (!matches.length) {
+                hideSkuSuggestions();
+                return;
+            }
+            box.innerHTML = matches.map((sku, i) =>
+                `<li role="option" tabindex="-1"${i === 0 ? ' aria-selected="true"' : ''}>${escapeHtml(sku)}</li>`
+            ).join('');
+            box.classList.remove('hidden');
+            box.querySelectorAll('li').forEach((li, i) => {
+                li.addEventListener('mousedown', (e) => {
+                    e.preventDefault();
+                    selectSkuSuggestion(matches[i]);
+                });
+            });
+        }
+
+        function selectSkuSuggestion(sku) {
+            const input = document.getElementById('skuInput');
+            input.value = sku;
+            hideSkuSuggestions();
+            setSkuInputStyle('valid');
+            updateStepperUI();
+            updateSubmitState();
+        }
+
+        function setSkuInputStyle(state) {
+            const input = document.getElementById('skuInput');
+            if (input.disabled) {
+                input.className = 'opname-field flex-1 min-w-0 border border-zinc-200 p-3 rounded-lg bg-zinc-50 text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none';
+                return;
+            }
+            if (state === 'valid') {
+                input.className = FIELD_EMERALD;
+            } else if (state === 'invalid') {
+                input.className = 'opname-field flex-1 min-w-0 border border-rose-300 p-3 rounded-lg bg-rose-50 text-rose-900 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none';
+            } else {
+                input.className = FIELD_AMBER;
+            }
+        }
+
+        function onSkuInput() {
+            const input = document.getElementById('skuInput');
+            setSkuInputStyle(false);
+            clearTimeout(skuSuggestTimer);
+            skuSuggestTimer = setTimeout(() => {
+                renderSkuSuggestions(filterSkuSuggestions(input.value));
+            }, 150);
+            updateStepperUI();
+            updateSubmitState();
+        }
+
+        function commitSkuInput() {
+            const input = document.getElementById('skuInput');
+            const trimmed = input.value.trim();
+            if (!trimmed) {
+                setSkuInputStyle(false);
+                hideSkuSuggestions();
+                updateStepperUI();
+                updateSubmitState();
+                return;
+            }
+            const resolved = resolveSku(trimmed);
+            if (!resolved) {
+                setSkuInputStyle('invalid');
+                updateStepperUI();
+                updateSubmitState();
+                return;
+            }
+            input.value = resolved;
+            setSkuInputStyle('valid');
+            hideSkuSuggestions();
+            updateStepperUI();
+            updateSubmitState();
+        }
+
+        function onSkuBlur() {
+            setTimeout(hideSkuSuggestions, 200);
+            commitSkuInput();
+        }
+
+        function applySkuScan(text) {
+            const resolved = resolveSku(text) || resolveSku(normalizeScanText(text));
+            if (!resolved) {
+                const scanned = normalizeScanText(text) || String(text).trim();
+                showToast(`SKU tidak dikenali: "${scanned.slice(0, 40)}".`, 'warning');
+                setSkuInputStyle('invalid');
+                return false;
+            }
+            document.getElementById('skuInput').value = resolved;
+            setSkuInputStyle('valid');
+            hideSkuSuggestions();
+            updateStepperUI();
+            updateSubmitState();
+            return true;
         }
 
         async function loadLookups() {
@@ -1335,16 +1502,12 @@ HTML_TEMPLATE = """
 
         function lockSkuFields() {
             document.getElementById('scanSkuBtn').disabled = true;
-            ['skuType', 'skuCategory', 'skuSelector'].forEach(id => {
-                const el = document.getElementById(id);
-                el.disabled = true;
-                el.innerHTML = id === 'skuType'
-                    ? '<option value="">Scan lokasi dulu</option>'
-                    : id === 'skuCategory'
-                    ? '<option value="">Pilih jenis dulu</option>'
-                    : '<option value="">Pilih kategori dulu</option>';
-                el.className = CLS.selLocked;
-            });
+            const input = document.getElementById('skuInput');
+            input.disabled = true;
+            input.value = '';
+            input.placeholder = 'Scan lokasi dulu';
+            setSkuInputStyle(false);
+            hideSkuSuggestions();
         }
 
         function resetLocationAndSku() {
@@ -1357,38 +1520,33 @@ HTML_TEMPLATE = """
             updateSubmitState();
         }
 
-        function enableSkuFields() {
+        async function enableSkuFields() {
             document.getElementById('scanSkuBtn').disabled = false;
-            const typeSelect = document.getElementById('skuType');
-            typeSelect.disabled = false;
-            typeSelect.className = CLS.selUnlocked;
-            typeSelect.innerHTML = '<option value="">Pilih jenis barang</option>';
-            Object.keys(skuTree).sort().forEach(type => {
-                typeSelect.options[typeSelect.options.length] = new Option(type, type);
-            });
-            const catSelect = document.getElementById('skuCategory');
-            catSelect.disabled = true;
-            catSelect.innerHTML = '<option value="">Pilih jenis dulu</option>';
-            catSelect.className = CLS.selLocked;
-            const skuSelect = document.getElementById('skuSelector');
-            skuSelect.disabled = true;
-            skuSelect.innerHTML = '<option value="">Pilih kategori dulu</option>';
-            skuSelect.className = CLS.selLocked;
+            const input = document.getElementById('skuInput');
+            input.disabled = false;
+            input.value = '';
+            input.placeholder = 'Memuat daftar SKU…';
+            setSkuInputStyle(false);
+            const ok = await ensureSkuIndex();
+            input.placeholder = ok ? 'Ketik atau scan kode SKU' : 'SKU tidak tersedia';
+            if (!ok) {
+                document.getElementById('scanSkuBtn').disabled = true;
+                input.disabled = true;
+            }
         }
 
         function resetSkuAndCount() {
             document.getElementById('count').value = '0';
             document.getElementById('notes').value = '';
-            enableSkuFields();
+            const input = document.getElementById('skuInput');
+            input.value = '';
+            hideSkuSuggestions();
+            if (!input.disabled) {
+                setSkuInputStyle(false);
+                input.placeholder = 'Ketik atau scan kode SKU';
+            }
             updateStepperUI();
             updateSubmitState();
-            // #region agent log
-            dbgLog('H3', 'resetSkuAndCount', 'after submit reset', {
-                locationFrozen,
-                loc: document.getElementById('location').value,
-                skuTypeDisabled: document.getElementById('skuType').disabled,
-            });
-            // #endregion
         }
 
         async function syncUIState(opts) {
@@ -1397,14 +1555,13 @@ HTML_TEMPLATE = """
             const locInput = document.getElementById('location');
             const historyContainer = document.getElementById('historyContainer');
             // #region agent log
-            const _skuType = document.getElementById('skuType');
             dbgLog('H1', 'syncUIState:entry', 'state snapshot', {
                 counterOk: isValidCounter(counterInput.value),
                 loc: locInput.value,
                 locValid: isValidLocation(locInput.value),
                 locationFrozen,
                 scanLocDisabled: document.getElementById('scanLocationBtn').disabled,
-                skuTypeDisabled: _skuType?.disabled,
+                skuInputDisabled: document.getElementById('skuInput').disabled,
                 skuBtnDisabled: document.getElementById('scanSkuBtn').disabled,
             });
             // #endregion
@@ -1422,7 +1579,7 @@ HTML_TEMPLATE = """
                     if (!locationFrozen) {
                         unlockFormForLocation();
                     } else {
-                        if (document.getElementById('skuType').disabled) {
+                        if (document.getElementById('skuInput').disabled) {
                             enableSkuFields();
                         } else {
                             document.getElementById('scanSkuBtn').disabled = false;
@@ -1458,7 +1615,7 @@ HTML_TEMPLATE = """
             dbgLog('H1', 'syncUIState:exit', 'after sync', {
                 locationFrozen,
                 scanLocDisabled: document.getElementById('scanLocationBtn').disabled,
-                skuTypeDisabled: document.getElementById('skuType').disabled,
+                skuInputDisabled: document.getElementById('skuInput').disabled,
                 stickyVisible: !document.getElementById('locationStickyBar').classList.contains('hidden'),
             });
             // #endregion
@@ -1533,6 +1690,19 @@ HTML_TEMPLATE = """
             }
             resetPageInteractionState();
             bindScanButtons();
+            const skuInput = document.getElementById('skuInput');
+            if (skuInput) {
+                skuInput.addEventListener('input', onSkuInput);
+                skuInput.addEventListener('blur', onSkuBlur);
+                skuInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') hideSkuSuggestions();
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        commitSkuInput();
+                        hideSkuSuggestions();
+                    }
+                });
+            }
             showLookupWarnings(lookupWarnings);
             await syncUIState({ refreshHistory: false });
             syncTopChromeLayout();
@@ -1638,7 +1808,7 @@ HTML_TEMPLATE = """
         function updateStepperUI() {
             const counterOk = isValidCounter(document.getElementById('counterName').value);
             const loc = document.getElementById('location').value.trim();
-            const sku = document.getElementById('skuSelector').value;
+            const sku = document.getElementById('skuInput').value.trim();
 
             setStepCardEnabled('step2Card', counterOk);
 
@@ -1659,7 +1829,7 @@ HTML_TEMPLATE = """
                 setStepDot(4, 'pending');
                 setStepCardEnabled('step3Card', false);
                 setStepCardEnabled('step4Card', false);
-            } else if (!sku) {
+            } else if (!sku || !resolveSku(sku)) {
                 setStepDot(1, 'done');
                 setStepDot(2, 'done');
                 setStepDot(3, 'active');
@@ -1681,7 +1851,7 @@ HTML_TEMPLATE = """
             const countOk = countVal !== '' && Number(countVal) > 0;
             const ready = isValidCounter(document.getElementById('counterName').value)
                 && resolveLocation(document.getElementById('location').value)
-                && resolveSku(document.getElementById('skuSelector').value)
+                && resolveSku(document.getElementById('skuInput').value)
                 && countOk;
             const btn = document.getElementById('submitBtn');
             btn.disabled = !ready || btn.dataset.loading === '1';
@@ -1692,7 +1862,7 @@ HTML_TEMPLATE = """
             if (!trimmed) return null;
             const key = normalizeScanText(trimmed, 'counter').toLowerCase();
             if (key && counterLookup[key]) return counterLookup[key];
-            const plain = trimmed.toLowerCase().replace(/\s+/g, ' ');
+            const plain = trimmed.toLowerCase().replace(/\\s+/g, ' ');
             if (plain && counterLookup[plain]) return counterLookup[plain];
             if (validCounters.has(trimmed)) return trimmed;
             for (const c of validCounters) {
@@ -1805,7 +1975,7 @@ HTML_TEMPLATE = """
             if (!trimmed) return null;
             const key = normalizeScanText(trimmed, 'location').toLowerCase();
             if (key && locationLookup[key]) return locationLookup[key];
-            const plain = trimmed.toLowerCase().replace(/\s+/g, ' ');
+            const plain = trimmed.toLowerCase().replace(/\\s+/g, ' ');
             if (plain && locationLookup[plain]) return locationLookup[plain];
             if (validLocations.has(trimmed)) return trimmed;
             for (const v of validLocations) {
@@ -1843,58 +2013,6 @@ HTML_TEMPLATE = """
             locInput.className = CLS.locUnlocked;
             freezeLocation();
             enableSkuFields();
-            updateStepperUI();
-            updateSubmitState();
-        }
-
-
-        function updateCategories() {
-            const typeVal = document.getElementById('skuType').value;
-            const catSelect = document.getElementById('skuCategory');
-            const skuSelect = document.getElementById('skuSelector');
-
-            catSelect.innerHTML = '<option value="">Pilih kategori</option>';
-            skuSelect.innerHTML = '<option value="">Pilih SKU</option>';
-            skuSelect.disabled = true;
-            skuSelect.className = CLS.selLocked;
-
-            if (!typeVal || !skuTree[typeVal]) {
-                catSelect.disabled = true;
-                catSelect.className = CLS.selLocked;
-                updateStepperUI();
-                updateSubmitState();
-                return;
-            }
-
-            catSelect.disabled = false;
-            catSelect.className = CLS.selUnlocked;
-            Object.keys(skuTree[typeVal]).sort().forEach(cat => {
-                catSelect.options[catSelect.options.length] = new Option(cat, cat);
-            });
-            updateStepperUI();
-            updateSubmitState();
-        }
-
-        function updateSkus() {
-            const typeVal = document.getElementById('skuType').value;
-            const catVal = document.getElementById('skuCategory').value;
-            const skuSelect = document.getElementById('skuSelector');
-
-            skuSelect.innerHTML = '<option value="">Pilih SKU</option>';
-
-            if (!catVal || !skuTree[typeVal] || !skuTree[typeVal][catVal]) {
-                skuSelect.disabled = true;
-                skuSelect.className = CLS.selLocked;
-                updateStepperUI();
-                updateSubmitState();
-                return;
-            }
-
-            skuSelect.disabled = false;
-            skuSelect.className = CLS.selUnlocked;
-            skuTree[typeVal][catVal].sort().forEach(sku => {
-                skuSelect.options[skuSelect.options.length] = new Option(sku, sku);
-            });
             updateStepperUI();
             updateSubmitState();
         }
@@ -1968,33 +2086,8 @@ HTML_TEMPLATE = """
                         } else if (currentTarget === 'location') {
                             shouldClose = applyLocationScan(text);
                         } else if (currentTarget === 'sku') {
-                            let found = false;
-                            const skuText = normalizeScanText(text) || text;
-                            for (const type in skuTree) {
-                                for (const cat in skuTree[type]) {
-                                    if (skuTree[type][cat].includes(skuText) || skuTree[type][cat].includes(text)) {
-                                        document.getElementById('skuType').value = type;
-                                        updateCategories();
-                                        document.getElementById('skuCategory').value = cat;
-                                        updateSkus();
-                                        document.getElementById('skuSelector').value = skuTree[type][cat].includes(skuText) ? skuText : text;
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                                if (found) break;
-                            }
-                            if (!found) {
-                                showToast('SKU tidak dikenali: ' + skuText, 'warning');
-                            } else {
-                                const resolved = resolveSku(document.getElementById('skuSelector').value);
-                                if (resolved) {
-                                    document.getElementById('skuSelector').value = resolved;
-                                }
-                                updateStepperUI();
-                                updateSubmitState();
-                                shouldClose = true;
-                            }
+                            if (!skuIndexLoaded) await ensureSkuIndex();
+                            shouldClose = applySkuScan(text);
                         }
                         if (shouldClose) {
                             markScanHandled(text, currentTarget);
@@ -2025,8 +2118,6 @@ HTML_TEMPLATE = """
         window.switchTab = switchTab;
         window.submitData = submitData;
         window.fetchHistory = fetchHistory;
-        window.updateCategories = updateCategories;
-        window.updateSkus = updateSkus;
         window.adjustCount = adjustCount;
 
         function adjustCount(amount) {
@@ -2104,7 +2195,7 @@ HTML_TEMPLATE = """
 
         async function submitData() {
             const locInput = document.getElementById('location').value;
-            const skuInput = document.getElementById('skuSelector').value;
+            const skuInput = document.getElementById('skuInput').value;
             const countInput = document.getElementById('count').value;
             const btn = document.getElementById('submitBtn');
             const label = document.getElementById('submitBtnLabel');
@@ -2383,12 +2474,6 @@ def api_debug_log():
     return "", 204
 
 
-_FALLBACK_SKU_TREE = {
-    "Finished": {
-        "Brushes": ["AR-BRSH-01", "AR-BRSH-02"]
-    }
-}
-
 @app.route('/')
 def session_page():
     return render_template_string(SESSION_HTML_TEMPLATE)
@@ -2398,27 +2483,22 @@ def count_page():
     location_lookup = {}
     counter_lookup = {}
     lookup_warnings = []
-    sku_tree = _FALLBACK_SKU_TREE
     try:
         lookups, _ = build_lookups_payload()
         location_lookup = lookups["location_lookup"]
         counter_lookup = lookups["counter_lookup"]
         lookup_warnings = lookups["lookup_warnings"]
-        wb = get_spreadsheet_cached()
-        sku_tree = load_sku_tree_cached(wb) or _FALLBACK_SKU_TREE
     except Exception:
         location_lookup = location_lookup or {}
         counter_lookup = counter_lookup or {}
 
     boot_data = {
-        "sku_tree": sku_tree,
         "location_lookup": location_lookup,
         "counter_lookup": counter_lookup,
         "lookup_warnings": lookup_warnings,
     }
     return render_template_string(
         HTML_TEMPLATE,
-        sku_tree=sku_tree,
         valid_locations=sorted(set(location_lookup.values())),
         location_lookup=location_lookup,
         counter_lookup=counter_lookup,
@@ -2426,6 +2506,22 @@ def count_page():
         lookup_warnings=lookup_warnings,
         boot_data=boot_data,
     )
+
+@app.route('/api/sku-codes')
+def api_sku_codes():
+    try:
+        force_refresh = request.args.get("refresh") in ("1", "true", "yes")
+        payload, from_cache = build_sku_payload(force_refresh=force_refresh)
+        response = jsonify({
+            "sku_lookup": payload["sku_lookup"],
+            "sku_codes": payload["sku_codes"],
+            "warnings": payload["warnings"],
+        })
+        if from_cache and not force_refresh:
+            response.headers["Cache-Control"] = f"private, max-age={_LOOKUPS_CACHE_TTL}"
+        return response, 200
+    except Exception as e:
+        return jsonify({"sku_lookup": {}, "sku_codes": [], "warnings": [], "error": str(e)}), 500
 
 @app.route('/api/sessions')
 def api_sessions():
@@ -2562,14 +2658,14 @@ def submit():
                 "message": f"Lokasi tidak valid: {raw}. Scan QR lokasi yang benar.",
             }), 400
 
-        sku_tree = load_sku_tree_cached(wb)
-        if not sku_tree:
+        sku_lookup = load_sku_lookup_cached(wb)
+        if not sku_lookup:
             return jsonify({
                 "status": "error",
                 "message": "Daftar SKU tidak tersedia. Periksa tab SKU List di sheet.",
             }), 400
 
-        sku_code = resolve_sku(data.get('sku', ''), sku_tree)
+        sku_code = resolve_sku(data.get('sku', ''), sku_lookup)
         if not sku_code:
             raw_sku = str(data.get('sku', '')).strip()
             return jsonify({
@@ -2589,7 +2685,7 @@ def submit():
             }), 409
 
         # Process standard row generation if duplicate test passes
-        log_id = str(uuid.uuid4())[:8] 
+        log_id = str(uuid.uuid4()) 
         parts = loc_string.split('-')
         
         zone = parts[0] if len(parts) > 0 else loc_string[:1]
