@@ -113,6 +113,11 @@ def invalidate_gudang_index_cache():
         _GUDANG_INDEX_CACHE["index"] = None
         _GUDANG_INDEX_CACHE["expires"] = 0.0
 
+def invalidate_lookups_cache():
+    with _CACHE_LOCK:
+        _LOOKUPS_CACHE["payload"] = None
+        _LOOKUPS_CACHE["expires"] = 0.0
+
 def update_dup_index_entry(session_id, counter_name, loc_string, sku_code, count):
     """Keep duplicate index warm after append without re-reading the sheet."""
     with _CACHE_LOCK:
@@ -284,10 +289,14 @@ def build_lookups_payload(force_refresh=False):
     wb = get_spreadsheet_cached()
     location_lookup, loc_warnings = get_valid_locations(wb)
     counter_lookup, counter_warnings = get_valid_counters(wb)
+    assignments_payload, assignment_warnings = build_assignments_payload(
+        wb, counter_lookup, location_lookup
+    )
     payload = {
         "location_lookup": location_lookup,
         "counter_lookup": counter_lookup,
-        "lookup_warnings": loc_warnings + counter_warnings,
+        "lookup_warnings": loc_warnings + counter_warnings + assignment_warnings,
+        **assignments_payload,
     }
     with _CACHE_LOCK:
         _LOOKUPS_CACHE["payload"] = payload
@@ -697,6 +706,228 @@ def resolve_counter(name, counter_lookup):
         return trimmed
     key = normalize_scan_text(trimmed, "counter").lower()
     return counter_lookup.get(key)
+
+ASSIGNMENTS_TAB_NAMES = (
+    "PETUGAS ASSIGNMENTS",
+    "Petugas Assignments",
+    "ASSIGNMENTS",
+    "Location Assignments",
+    "Penugasan Lokasi",
+)
+
+def load_petugas_assignments(wb):
+    ws = get_worksheet_by_names(wb, ASSIGNMENTS_TAB_NAMES)
+    if not ws:
+        return []
+    try:
+        rows = ws.get_all_values()
+    except Exception:
+        return []
+    if not rows:
+        return []
+    headers = [str(c).strip().lower() for c in rows[0]]
+    session_idx = _header_column_index(
+        headers, ("session id", "session_id", "id sesi", "sesi id")
+    )
+    counter_idx = _header_column_index(
+        headers,
+        (
+            "petugas", "counter", "counter name", "nama", "nama petugas",
+            "name", "id badge", "badge",
+        ),
+    )
+    location_idx = _header_column_index(
+        headers,
+        ("location", "lokasi", "precise location", "kode lokasi", "zone", "lokasi ditugaskan"),
+    )
+    if session_idx is None:
+        session_idx = 0
+    if counter_idx is None:
+        counter_idx = 1
+    if location_idx is None:
+        location_idx = 2
+    out = []
+    for row in rows[1:]:
+        padded = list(row) + ["", "", ""]
+        session_id = str(padded[session_idx]).strip()
+        counter = str(padded[counter_idx]).strip()
+        location = str(padded[location_idx]).strip()
+        if session_id and counter and location:
+            out.append({
+                "session_id": session_id,
+                "counter": counter,
+                "location": location,
+            })
+    return out
+
+def build_assignments_payload(wb, counter_lookup, location_lookup):
+    """Per-session petugas→locations map. Sessions with no rows are not enforced."""
+    rows = load_petugas_assignments(wb)
+    by_session = {}
+    enforced_session_ids = set()
+    warnings = []
+    for item in rows:
+        session_id = item["session_id"]
+        raw_counter = item["counter"]
+        raw_location = item["location"]
+        counter = resolve_counter(raw_counter, counter_lookup)
+        location = resolve_location(raw_location, location_lookup)
+        if raw_counter and counter_lookup and not counter:
+            warnings.append(
+                f"PETUGAS ASSIGNMENTS: petugas tidak di COUNTERS — {raw_counter!r} (sesi {session_id})"
+            )
+            continue
+        if raw_location and location_lookup and not location:
+            warnings.append(
+                f"PETUGAS ASSIGNMENTS: lokasi tidak di LOCATIONS — {raw_location!r} (sesi {session_id})"
+            )
+            continue
+        if not counter or not location:
+            continue
+        enforced_session_ids.add(session_id)
+        counter_key = counter.lower()
+        by_session.setdefault(session_id, {}).setdefault(counter_key, set()).add(location)
+    assignments = {
+        sid: {ck: sorted(locs) for ck, locs in counters.items()}
+        for sid, counters in by_session.items()
+    }
+    return (
+        {
+            "assignments": assignments,
+            "enforced_session_ids": sorted(enforced_session_ids),
+        },
+        warnings,
+    )
+
+def ensure_petugas_assignments_tab(wb):
+    ws = get_worksheet_by_names(wb, ASSIGNMENTS_TAB_NAMES)
+    if ws:
+        return ws
+    ws = wb.add_worksheet(title="PETUGAS ASSIGNMENTS", rows=500, cols=3)
+    ws.append_row(["Session ID", "Petugas", "Location"])
+    invalidate_lookups_cache()
+    return ws
+
+def save_petugas_assignments(assignments):
+    wb = get_spreadsheet_cached()
+    lookups, _ = build_lookups_payload(force_refresh=True)
+    counter_lookup = lookups.get("counter_lookup") or {}
+    location_lookup = lookups.get("location_lookup") or {}
+    body = [["Session ID", "Petugas", "Location"]]
+    warnings = []
+    seen = set()
+    for item in assignments:
+        if not isinstance(item, dict):
+            continue
+        session_id = str(item.get("session_id", "")).strip()
+        raw_counter = str(item.get("counter", "")).strip()
+        raw_location = str(item.get("location", "")).strip()
+        if not session_id and not raw_counter and not raw_location:
+            continue
+        if not session_id:
+            warnings.append(f"Baris tanpa Session ID diabaikan (petugas {raw_counter!r}).")
+            continue
+        if not require_valid_session_id(session_id):
+            warnings.append(f"Sesi tidak valid diabaikan: {session_id!r}.")
+            continue
+        if not raw_counter or not raw_location:
+            warnings.append(
+                f"Baris tidak lengkap diabaikan (sesi {session_id}, petugas {raw_counter!r})."
+            )
+            continue
+        counter = resolve_counter(raw_counter, counter_lookup)
+        location = resolve_location(raw_location, location_lookup)
+        if not counter:
+            warnings.append(f"Petugas tidak di COUNTERS: {raw_counter!r}.")
+            continue
+        if not location:
+            warnings.append(f"Lokasi tidak di LOCATIONS: {raw_location!r}.")
+            continue
+        key = (session_id, counter.lower(), location.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        body.append([session_id, counter, location])
+    ws = ensure_petugas_assignments_tab(wb)
+    ws.clear()
+    ws.update(body, range_name="A1")
+    invalidate_lookups_cache()
+    return len(body) - 1, warnings
+
+def build_petugas_assignments_admin_payload(force_refresh=False):
+    wb = get_spreadsheet_cached()
+    lookups, from_cache = build_lookups_payload(force_refresh=force_refresh)
+    counter_lookup = lookups.get("counter_lookup") or {}
+    location_lookup = lookups.get("location_lookup") or {}
+    rows = load_petugas_assignments(wb)
+    assignments = []
+    for item in rows:
+        counter = resolve_counter(item["counter"], counter_lookup) or item["counter"]
+        location = resolve_location(item["location"], location_lookup) or item["location"]
+        assignments.append({
+            "session_id": item["session_id"],
+            "counter": counter,
+            "location": location,
+            "valid": bool(
+                resolve_counter(item["counter"], counter_lookup)
+                and resolve_location(item["location"], location_lookup)
+            ),
+        })
+    sessions, _ = build_sessions_payload(force_refresh=force_refresh)
+    assignment_warnings = [
+        w for w in (lookups.get("lookup_warnings") or [])
+        if "PETUGAS ASSIGNMENTS" in w
+    ]
+    counters_without = {}
+    enforced = set(lookups.get("enforced_session_ids") or [])
+    by_session = lookups.get("assignments") or {}
+    for sid in enforced:
+        session_counters = set(counter_lookup.values())
+        assigned = set((by_session.get(sid) or {}).keys())
+        missing = sorted(
+            c for c in session_counters
+            if c.lower() not in assigned
+        )
+        if missing:
+            counters_without[sid] = missing
+    return {
+        "assignments": assignments,
+        "sessions": sessions,
+        "counters": sorted(set(counter_lookup.values())),
+        "locations": sorted(set(location_lookup.values())),
+        "enforced_session_ids": sorted(enforced),
+        "counters_without_assignments": counters_without,
+        "warnings": assignment_warnings,
+    }, from_cache
+
+def session_has_assignment_enforcement(session_id, enforced_session_ids):
+    if not session_id or not enforced_session_ids:
+        return False
+    return session_id in enforced_session_ids
+
+def validate_petugas_location_assignment(
+    session_id, counter_name, loc_string, assignments, enforced_session_ids, counter_lookup
+):
+    if not session_has_assignment_enforcement(session_id, enforced_session_ids):
+        return True, None
+    canonical = resolve_counter(counter_name, counter_lookup) or counter_name
+    counter_key = canonical.lower()
+    session_map = assignments.get(session_id) or {}
+    allowed = session_map.get(counter_key) or []
+    if not allowed:
+        return False, (
+            f"Petugas {canonical} belum ditugaskan lokasi untuk sesi ini. "
+            "Hubungi admin untuk mengisi tab PETUGAS ASSIGNMENTS."
+        )
+    if loc_string in allowed:
+        return True, None
+    preview = ", ".join(allowed[:8])
+    if len(allowed) > 8:
+        preview += f", … (+{len(allowed) - 8} lokasi)"
+    return False, (
+        f"Lokasi {loc_string} tidak ditugaskan untuk {canonical}. "
+        f"Lokasi Anda: {preview}."
+    )
 
 def _header_column_index(header_row, aliases):
     for i, cell in enumerate(header_row):
@@ -1180,7 +1411,7 @@ SESSION_HTML_TEMPLATE = """
             <p id="sessionError" class="hidden text-sm text-rose-600"></p>
         </div>
         <p class="text-xs text-zinc-400 text-center mt-6">End Session hanya di perangkat ini — tidak menutup sesi di sheet.</p>
-        <p class="text-center mt-3"><a href="/admin/stock" class="text-xs font-semibold text-violet-600 hover:text-violet-800">Admin: upload stok sistem</a></p>
+        <p class="text-center mt-3"><a href="/admin/stock" class="text-xs font-semibold text-violet-600 hover:text-violet-800">Admin: stok sistem &amp; penugasan lokasi</a></p>
     </main>
     <script>
         const SESSION_STORAGE_KEY = 'aeris_opname_session';
@@ -1631,6 +1862,8 @@ HTML_TEMPLATE = """
         let locationLookup = _boot.location_lookup || {};
         let counterLookup = _boot.counter_lookup || {};
         let lookupWarnings = _boot.lookup_warnings || [];
+        let locationAssignments = _boot.assignments || {};
+        let enforcedSessionIds = new Set(_boot.enforced_session_ids || []);
         let validLocations = new Set(Object.values(locationLookup));
         let validCounters = new Set(Object.values(counterLookup));
         let currentTarget = '';
@@ -1679,12 +1912,44 @@ HTML_TEMPLATE = """
         function applyLookupData(data) {
             locationLookup = data.locations || {};
             counterLookup = data.counters || {};
+            locationAssignments = data.assignments || {};
+            enforcedSessionIds = new Set(data.enforced_session_ids || []);
             validLocations = new Set(Object.values(locationLookup));
             validCounters = new Set(Object.values(counterLookup));
             if (data.warnings) {
                 lookupWarnings = data.warnings;
                 showLookupWarnings(lookupWarnings);
             }
+        }
+
+        function isAssignmentEnforcedForSession() {
+            return !!(activeSession && activeSession.sessionId && enforcedSessionIds.has(activeSession.sessionId));
+        }
+
+        function getAllowedLocationsForCounter(counterName) {
+            if (!isAssignmentEnforcedForSession()) return null;
+            const resolved = resolveCounter(counterName);
+            if (!resolved) return [];
+            const sess = locationAssignments[activeSession.sessionId] || {};
+            return sess[resolved.toLowerCase()] || [];
+        }
+
+        function assignmentBlockMessage(counterName) {
+            const allowed = getAllowedLocationsForCounter(counterName);
+            const resolved = resolveCounter(counterName) || counterName;
+            if (!allowed || !allowed.length) {
+                return `Petugas ${resolved} belum ditugaskan lokasi untuk sesi ini. Hubungi admin.`;
+            }
+            let preview = allowed.slice(0, 8).join(', ');
+            if (allowed.length > 8) preview += `, … (+${allowed.length - 8} lokasi)`;
+            return `Lokasi tidak ditugaskan untuk ${resolved}. Lokasi Anda: ${preview}.`;
+        }
+
+        function isLocationAllowedForPetugas(counterName, location) {
+            const allowed = getAllowedLocationsForCounter(counterName);
+            if (allowed === null) return true;
+            if (!allowed.length) return false;
+            return allowed.includes(location);
         }
 
         function resolveSku(code) {
@@ -2454,6 +2719,11 @@ HTML_TEMPLATE = """
                 showToast(`Lokasi tidak dikenali: "${scanned.slice(0, 40)}". Periksa tab LOCATIONS.`, 'warning');
                 return false;
             }
+            const counterName = document.getElementById('counterName').value;
+            if (!isLocationAllowedForPetugas(counterName, resolved)) {
+                showToast(assignmentBlockMessage(counterName), 'warning');
+                return false;
+            }
             document.getElementById('location').value = resolved;
             unlockFormForLocation();
             return true;
@@ -2662,6 +2932,11 @@ HTML_TEMPLATE = """
                 return;
             }
 
+            if (!isLocationAllowedForPetugas(document.getElementById('counterName').value, resolvedLocation)) {
+                showToast(assignmentBlockMessage(document.getElementById('counterName').value), 'warning');
+                return;
+            }
+
             btn.disabled = true;
             btn.dataset.loading = '1';
             label.textContent = 'Menyimpan…';
@@ -2687,6 +2962,8 @@ HTML_TEMPLATE = """
 
                 if (response.status === 409) {
                     showToast(result.message || 'Data duplikat. Gunakan Edit di Riwayat.', 'warning');
+                } else if (response.status === 403) {
+                    showToast(result.message || 'Lokasi tidak ditugaskan untuk petugas ini.', 'warning');
                 } else if (response.status === 400) {
                     showToast(result.message || 'Lokasi tidak valid.', 'warning');
                 } else if (response.ok) {
@@ -3186,7 +3463,7 @@ ADMIN_STOCK_HTML_TEMPLATE = """
         <div class="max-w-4xl mx-auto px-4 py-3 flex items-start justify-between gap-4">
             <div>
                 <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Aeris Beaute</h1>
-                <p class="text-xs text-zinc-500">Admin — stok sistem vs opname</p>
+                <p class="text-xs text-zinc-500">Admin — stok sistem &amp; penugasan lokasi</p>
             </div>
             <nav class="flex flex-col items-end gap-1 text-xs font-semibold shrink-0">
                 <a href="/" class="text-zinc-500 hover:text-violet-700">Sessions</a>
@@ -3222,6 +3499,59 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             <p id="uploadStatus" class="hidden text-sm"></p>
             <ul id="uploadWarnings" class="hidden text-sm text-amber-700 list-disc pl-5 space-y-1"></ul>
             <div id="uploadUnmappedBox" class="hidden mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950"></div>
+        </section>
+
+        <section id="assignmentsSection" class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+                <h2 class="text-base font-bold text-zinc-900">Penugasan lokasi petugas</h2>
+                <button type="button" onclick="loadPetugasAssignments(true)" class="text-xs font-semibold text-violet-700 hover:text-violet-900">Muat ulang</button>
+            </div>
+            <p class="text-sm text-zinc-600">
+                Tentukan lokasi yang boleh dihitung setiap petugas per sesi. Sesi yang punya minimal satu baris di sini akan <strong>mengunci</strong> pemilihan lokasi di halaman Count.
+                Data disimpan ke tab <strong>PETUGAS ASSIGNMENTS</strong> di Google Sheet.
+            </p>
+            <div class="grid gap-4 sm:grid-cols-2">
+                <div>
+                    <label for="assignSessionFilter" class="block text-sm font-semibold text-zinc-700 mb-2">Filter sesi (tampilan)</label>
+                    <select id="assignSessionFilter" onchange="renderAssignmentTable()"
+                        class="w-full border border-zinc-200 rounded-lg px-3 py-2.5 text-sm bg-white focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                        <option value="">Semua sesi</option>
+                    </select>
+                </div>
+                <div class="flex items-end">
+                    <button type="button" onclick="addAssignmentRow()"
+                        class="w-full sm:w-auto px-4 py-2.5 rounded-lg border border-violet-200 bg-violet-50 text-violet-800 text-sm font-semibold hover:bg-violet-100">
+                        + Tambah baris
+                    </button>
+                </div>
+            </div>
+            <div id="assignWarningsBox" class="hidden rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950 space-y-1"></div>
+            <div id="assignGapBox" class="hidden rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950"></div>
+            <div class="overflow-x-auto border border-zinc-200 rounded-lg">
+                <table class="w-full text-sm min-w-[36rem]">
+                    <thead class="bg-zinc-50 border-b border-zinc-200">
+                        <tr>
+                            <th class="text-left px-3 py-2 font-semibold text-zinc-700">Session ID</th>
+                            <th class="text-left px-3 py-2 font-semibold text-zinc-700">Petugas</th>
+                            <th class="text-left px-3 py-2 font-semibold text-zinc-700">Location</th>
+                            <th class="w-16 px-2 py-2"></th>
+                        </tr>
+                    </thead>
+                    <tbody id="assignmentsBody">
+                        <tr><td colspan="4" class="px-3 py-6 text-center text-zinc-400">Memuat…</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <datalist id="assignCounterList"></datalist>
+            <datalist id="assignLocationList"></datalist>
+            <datalist id="assignSessionList"></datalist>
+            <div class="flex flex-wrap items-center gap-3">
+                <button type="button" id="saveAssignmentsBtn" onclick="savePetugasAssignments()"
+                    class="px-5 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white text-sm font-semibold">
+                    Simpan penugasan
+                </button>
+                <p id="assignSaveStatus" class="hidden text-sm"></p>
+            </div>
         </section>
 
         <section id="setupCheckSection" class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-3">
@@ -3371,7 +3701,204 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             }
         }
 
-        window.onload = () => { loadSessions(); loadUnmappedLocations(); };
+        let assignmentRows = [];
+        let assignmentMeta = { counters: [], locations: [], sessions: [] };
+
+        function escapeHtml(str) {
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function fillDatalist(id, values) {
+            const el = document.getElementById(id);
+            el.innerHTML = (values || []).map(v => `<option value="${escapeHtml(v)}"></option>`).join('');
+        }
+
+        function getAssignmentFilterSession() {
+            return document.getElementById('assignSessionFilter').value.trim();
+        }
+
+        function visibleAssignmentRows() {
+            const filter = getAssignmentFilterSession();
+            if (!filter) return assignmentRows;
+            return assignmentRows.filter(r => r.session_id === filter);
+        }
+
+        function renderAssignmentTable() {
+            const body = document.getElementById('assignmentsBody');
+            const rows = visibleAssignmentRows();
+            if (!rows.length) {
+                const filter = getAssignmentFilterSession();
+                body.innerHTML = '<tr><td colspan="4" class="px-3 py-6 text-center text-zinc-400">' +
+                    (filter ? 'Belum ada penugasan untuk sesi ini.' : 'Belum ada penugasan. Ketuk Tambah baris.') +
+                    '</td></tr>';
+                return;
+            }
+            body.innerHTML = rows.map((row, idx) => {
+                const globalIdx = assignmentRows.indexOf(row);
+                const invalid = row._invalid;
+                const rowCls = invalid ? 'bg-rose-50/80' : '';
+                return `<tr class="border-b border-zinc-100 ${rowCls}" data-idx="${globalIdx}">
+                    <td class="px-2 py-1.5">
+                        <input list="assignSessionList" value="${escapeHtml(row.session_id)}"
+                            onchange="updateAssignmentField(${globalIdx}, 'session_id', this.value)"
+                            class="w-full min-w-[7rem] border border-zinc-200 rounded px-2 py-1.5 text-xs font-mono">
+                    </td>
+                    <td class="px-2 py-1.5">
+                        <input list="assignCounterList" value="${escapeHtml(row.counter)}"
+                            onchange="updateAssignmentField(${globalIdx}, 'counter', this.value)"
+                            class="w-full min-w-[8rem] border border-zinc-200 rounded px-2 py-1.5 text-xs">
+                    </td>
+                    <td class="px-2 py-1.5">
+                        <input list="assignLocationList" value="${escapeHtml(row.location)}"
+                            onchange="updateAssignmentField(${globalIdx}, 'location', this.value)"
+                            class="w-full min-w-[8rem] border border-zinc-200 rounded px-2 py-1.5 text-xs font-mono">
+                    </td>
+                    <td class="px-2 py-1.5 text-center">
+                        <button type="button" onclick="removeAssignmentRow(${globalIdx})"
+                            class="text-xs font-semibold text-rose-600 hover:text-rose-800">Hapus</button>
+                    </td>
+                </tr>`;
+            }).join('');
+        }
+
+        function updateAssignmentField(idx, field, value) {
+            if (!assignmentRows[idx]) return;
+            assignmentRows[idx][field] = String(value || '').trim();
+            assignmentRows[idx]._invalid = false;
+        }
+
+        function addAssignmentRow() {
+            const sessionId = getAssignmentFilterSession() || (assignmentMeta.sessions[0] && assignmentMeta.sessions[0].id) || '';
+            assignmentRows.push({ session_id: sessionId, counter: '', location: '', _invalid: false });
+            renderAssignmentTable();
+        }
+
+        function removeAssignmentRow(idx) {
+            assignmentRows.splice(idx, 1);
+            renderAssignmentTable();
+        }
+
+        function showAssignWarnings(messages) {
+            const box = document.getElementById('assignWarningsBox');
+            if (!messages || !messages.length) {
+                box.classList.add('hidden');
+                box.innerHTML = '';
+                return;
+            }
+            box.classList.remove('hidden');
+            box.innerHTML = '<p class="font-semibold">Perhatian:</p>' +
+                messages.map(m => `<p>• ${escapeHtml(m)}</p>`).join('');
+        }
+
+        function showAssignGaps(countersWithout) {
+            const box = document.getElementById('assignGapBox');
+            const entries = Object.entries(countersWithout || {});
+            if (!entries.length) {
+                box.classList.add('hidden');
+                box.innerHTML = '';
+                return;
+            }
+            box.classList.remove('hidden');
+            let html = '<p class="font-semibold mb-2">Petugas di COUNTERS tanpa penugasan (sesi terkunci):</p><ul class="list-disc pl-5 space-y-2">';
+            entries.forEach(([sid, names]) => {
+                html += `<li><span class="font-mono text-xs">${escapeHtml(sid)}</span>: ${escapeHtml(names.join(', '))}</li>`;
+            });
+            html += '</ul>';
+            box.innerHTML = html;
+        }
+
+        async function loadPetugasAssignments(forceRefresh = false) {
+            const body = document.getElementById('assignmentsBody');
+            body.innerHTML = '<tr><td colspan="4" class="px-3 py-6 text-center text-zinc-400 animate-pulse">Memuat…</td></tr>';
+            try {
+                const qs = forceRefresh ? '?refresh=1' : '';
+                const res = await fetch('/api/admin/petugas-assignments' + qs);
+                const data = await res.json();
+                assignmentRows = (data.assignments || []).map(r => ({
+                    session_id: r.session_id || '',
+                    counter: r.counter || '',
+                    location: r.location || '',
+                    _invalid: r.valid === false,
+                }));
+                assignmentMeta = {
+                    counters: data.counters || [],
+                    locations: data.locations || [],
+                    sessions: data.sessions || [],
+                };
+                fillDatalist('assignCounterList', assignmentMeta.counters);
+                fillDatalist('assignLocationList', assignmentMeta.locations);
+                fillDatalist('assignSessionList', assignmentMeta.sessions.map(s => s.id));
+                const filterSel = document.getElementById('assignSessionFilter');
+                const prev = filterSel.value;
+                filterSel.innerHTML = '<option value="">Semua sesi</option>';
+                assignmentMeta.sessions.forEach(s => {
+                    const opt = document.createElement('option');
+                    opt.value = s.id;
+                    opt.textContent = s.name + ' (' + s.id + ')';
+                    filterSel.appendChild(opt);
+                });
+                if (prev && [...filterSel.options].some(o => o.value === prev)) {
+                    filterSel.value = prev;
+                }
+                showAssignWarnings(data.warnings || []);
+                showAssignGaps(data.counters_without_assignments || {});
+                renderAssignmentTable();
+            } catch (e) {
+                body.innerHTML = '<tr><td colspan="4" class="px-3 py-6 text-center text-rose-600">Gagal memuat penugasan.</td></tr>';
+            }
+        }
+
+        async function savePetugasAssignments() {
+            const btn = document.getElementById('saveAssignmentsBtn');
+            const statusEl = document.getElementById('assignSaveStatus');
+            btn.disabled = true;
+            statusEl.classList.remove('hidden', 'text-rose-600', 'text-emerald-700');
+            statusEl.textContent = 'Menyimpan…';
+            statusEl.classList.add('text-zinc-600');
+            const payload = {
+                assignments: assignmentRows
+                    .filter(r => r.session_id || r.counter || r.location)
+                    .map(r => ({
+                        session_id: r.session_id,
+                        counter: r.counter,
+                        location: r.location,
+                    })),
+            };
+            try {
+                const res = await fetch('/api/admin/petugas-assignments', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.message || 'Simpan gagal');
+                let msg = 'Tersimpan: ' + (data.assignment_count || 0) + ' baris penugasan.';
+                if (data.warnings && data.warnings.length) {
+                    msg += ' ' + data.warnings.length + ' baris diabaikan — lihat peringatan.';
+                }
+                statusEl.textContent = msg;
+                statusEl.classList.remove('text-zinc-600');
+                statusEl.classList.add('text-emerald-700');
+                showAssignWarnings((data.warnings || []).concat(data.sheet_warnings || []));
+                await loadPetugasAssignments(true);
+            } catch (e) {
+                statusEl.textContent = e.message || 'Simpan gagal';
+                statusEl.classList.remove('text-zinc-600');
+                statusEl.classList.add('text-rose-600');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        window.onload = () => {
+            loadSessions();
+            loadPetugasAssignments();
+            loadUnmappedLocations();
+        };
     </script>
 </body>
 </html>
@@ -3388,12 +3915,14 @@ def count_page():
     location_lookup = {}
     counter_lookup = {}
     lookup_warnings = []
+    lookups = {}
     try:
         lookups, _ = build_lookups_payload()
         location_lookup = lookups["location_lookup"]
         counter_lookup = lookups["counter_lookup"]
         lookup_warnings = lookups["lookup_warnings"]
     except Exception:
+        lookups = {}
         location_lookup = location_lookup or {}
         counter_lookup = counter_lookup or {}
 
@@ -3401,6 +3930,8 @@ def count_page():
         "location_lookup": location_lookup,
         "counter_lookup": counter_lookup,
         "lookup_warnings": lookup_warnings,
+        "assignments": lookups.get("assignments") or {},
+        "enforced_session_ids": lookups.get("enforced_session_ids") or [],
     }
     return render_template_string(
         HTML_TEMPLATE,
@@ -3451,6 +3982,8 @@ def api_lookups():
             "location_count": len(lookups["location_lookup"]),
             "counter_count": len(lookups["counter_lookup"]),
             "warnings": lookups["lookup_warnings"],
+            "assignments": lookups.get("assignments") or {},
+            "enforced_session_ids": lookups.get("enforced_session_ids") or [],
         })
         if from_cache and not force_refresh:
             response.headers["Cache-Control"] = f"private, max-age={_LOOKUPS_CACHE_TTL}"
@@ -3462,6 +3995,8 @@ def api_lookups():
             "location_count": 0,
             "counter_count": 0,
             "warnings": [],
+            "assignments": {},
+            "enforced_session_ids": [],
             "error": str(e),
         }), 500
 
@@ -3533,6 +4068,48 @@ def api_admin_gudang_locations_post():
             return jsonify({"status": "error", "message": "mappings harus berupa array."}), 400
         count = save_gudang_location_mappings(mappings)
         return jsonify({"status": "success", "mapping_count": count}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/admin/petugas-assignments', methods=['GET'])
+def api_admin_petugas_assignments_get():
+    try:
+        force_refresh = request.args.get("refresh") in ("1", "true", "yes")
+        payload, from_cache = build_petugas_assignments_admin_payload(force_refresh=force_refresh)
+        response = jsonify(payload)
+        if from_cache and not force_refresh:
+            response.headers["Cache-Control"] = f"private, max-age={_LOOKUPS_CACHE_TTL}"
+        return response, 200
+    except Exception as e:
+        return jsonify({
+            "assignments": [],
+            "sessions": [],
+            "counters": [],
+            "locations": [],
+            "enforced_session_ids": [],
+            "counters_without_assignments": {},
+            "warnings": [],
+            "error": str(e),
+        }), 500
+
+@app.route('/api/admin/petugas-assignments', methods=['POST'])
+def api_admin_petugas_assignments_post():
+    try:
+        data = request.get_json(silent=True) or {}
+        assignments = data.get("assignments")
+        if assignments is None:
+            return jsonify({"status": "error", "message": "assignments wajib diisi."}), 400
+        if not isinstance(assignments, list):
+            return jsonify({"status": "error", "message": "assignments harus berupa array."}), 400
+        count, warnings = save_petugas_assignments(assignments)
+        payload, _ = build_petugas_assignments_admin_payload(force_refresh=True)
+        return jsonify({
+            "status": "success",
+            "assignment_count": count,
+            "warnings": warnings,
+            "sheet_warnings": payload.get("warnings") or [],
+            "counters_without_assignments": payload.get("counters_without_assignments") or {},
+        }), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -3629,6 +4206,20 @@ def submit():
                 "status": "invalid_location",
                 "message": f"Lokasi tidak valid: {raw}. Scan QR lokasi yang benar.",
             }), 400
+
+        ok, assignment_msg = validate_petugas_location_assignment(
+            session_id,
+            counter_name,
+            loc_string,
+            lookups.get("assignments") or {},
+            lookups.get("enforced_session_ids") or [],
+            counter_lookup,
+        )
+        if not ok:
+            return jsonify({
+                "status": "location_not_assigned",
+                "message": assignment_msg,
+            }), 403
 
         sku_lookup = load_sku_lookup_cached(wb)
         if not sku_lookup:
