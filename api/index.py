@@ -1861,8 +1861,8 @@ HTML_TEMPLATE = """
         function normalizeScanText(code, kind = 'any') {
             let s = String(code || '').trim().replace(/\\ufeff/g, '').replace(/\\u200b/g, '').replace(/\\r/g, '').replace(/\\n/g, '');
             if (!s) return '';
-            if (/^https?:\/\//i.test(s) || s.includes('://')) {
-                s = s.replace(/\/+$/, '').split('/').pop();
+            if (/^https?:\\/\\//i.test(s) || s.includes('://')) {
+                s = s.replace(/\\/+$/, '').split('/').pop();
             }
             if (s.includes('?')) s = s.split('?')[0];
             if (s.includes('#')) s = s.split('#')[0];
