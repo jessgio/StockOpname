@@ -1,6 +1,7 @@
 import os
 import json
 import time
+from io import BytesIO
 from threading import Lock
 from flask import Flask, render_template_string, request, jsonify
 import gspread
@@ -8,6 +9,7 @@ from google.oauth2.service_account import Credentials
 import uuid
 from datetime import datetime, timedelta
 import pytz
+from openpyxl import load_workbook
 
 app = Flask(__name__)
 
@@ -29,6 +31,7 @@ def get_spreadsheet():
 _SPREADSHEET_CACHE = {"wb": None, "expires": 0.0}
 _SUMMARY_CACHE = {"by_session": {}, "expires": 0.0}
 _LOOKUPS_CACHE = {"payload": None, "expires": 0.0}
+_GUDANG_INDEX_CACHE = {"index": None, "expires": 0.0}
 _SKU_LOOKUP_CACHE = {"payload": None, "expires": 0.0}
 _DUP_INDEX_CACHE = {}
 _SESSIONS_CACHE = {"sessions": None, "expires": 0.0}
@@ -104,6 +107,11 @@ def invalidate_count_caches(counter_name=None, session_id=None, invalidate_dup=T
     invalidate_history_cache(counter_name, session_id)
     invalidate_summary_cache(session_id)
     invalidate_dashboard_cache(session_id)
+
+def invalidate_gudang_index_cache():
+    with _CACHE_LOCK:
+        _GUDANG_INDEX_CACHE["index"] = None
+        _GUDANG_INDEX_CACHE["expires"] = 0.0
 
 def update_dup_index_entry(session_id, counter_name, loc_string, sku_code, count):
     """Keep duplicate index warm after append without re-reading the sheet."""
@@ -809,6 +817,307 @@ def aggregate_counts_by_sku(records):
     grand_total = sum(r["total"] for r in rows)
     return rows, grand_total
 
+GUDANG_LOCATION_TAB_NAMES = ("GUDANG LOCATIONS", "Gudang Locations", "Location Gudang")
+STOCK_RECON_HEADERS = ("Gudang", "SKU", "System Qty", "Running Count", "Gap", "Variance %")
+_EXCEL_GUDANG_ROW = 5
+_EXCEL_SKU_COL = 3
+_EXCEL_DATA_START_ROW = 6
+
+def sanitize_worksheet_title(name):
+    s = str(name or "").strip()
+    for ch in (":", "\\", "/", "?", "*", "[", "]"):
+        s = s.replace(ch, "-")
+    return (s[:100] if s else "Session")
+
+def parse_excel_quantity(value):
+    if value is None or value == "":
+        return 0
+    if isinstance(value, (int, float)):
+        return int(round(value))
+    s = str(value).strip().replace(",", "")
+    if not s:
+        return 0
+    try:
+        return int(round(float(s)))
+    except (ValueError, TypeError):
+        return 0
+
+def normalize_gudang_label(name):
+    return " ".join(str(name or "").strip().split())
+
+def ensure_gudang_locations_tab(wb):
+    ws = get_worksheet_by_names(wb, GUDANG_LOCATION_TAB_NAMES)
+    if ws:
+        return ws
+    ws = wb.add_worksheet(title="GUDANG LOCATIONS", rows=500, cols=3)
+    ws.append_row(["Location", "Gudang", "Notes"])
+    invalidate_gudang_index_cache()
+    return ws
+
+def load_gudang_location_mappings(wb):
+    ws = get_worksheet_by_names(wb, GUDANG_LOCATION_TAB_NAMES)
+    if not ws:
+        return []
+    try:
+        rows = ws.get_all_values()
+    except Exception:
+        return []
+    if not rows:
+        return []
+    headers = [str(c).strip().lower() for c in rows[0]]
+    loc_idx = _header_column_index(headers, ("location", "lokasi", "precise location", "kode lokasi", "zone"))
+    gudang_idx = _header_column_index(headers, ("gudang", "warehouse", "gudang name"))
+    notes_idx = _header_column_index(headers, ("notes", "catatan", "keterangan"))
+    if loc_idx is None:
+        loc_idx = 0
+    if gudang_idx is None:
+        gudang_idx = 1
+    mappings = []
+    for row in rows[1:]:
+        padded = list(row) + ["", "", ""]
+        location = str(padded[loc_idx]).strip()
+        gudang = normalize_gudang_label(padded[gudang_idx])
+        notes = str(padded[notes_idx]).strip() if notes_idx is not None else ""
+        if location and gudang:
+            mappings.append({"location": location, "gudang": gudang, "notes": notes})
+    return mappings
+
+def build_gudang_location_index(wb, force_refresh=False):
+    now = time.time()
+    if not force_refresh:
+        with _CACHE_LOCK:
+            cached = _GUDANG_INDEX_CACHE.get("index")
+            if cached is not None and now < _GUDANG_INDEX_CACHE.get("expires", 0):
+                return cached, True
+    mappings = load_gudang_location_mappings(wb)
+    index = {}
+    for item in mappings:
+        loc = item["location"]
+        gudang = item["gudang"]
+        index[loc.lower()] = gudang
+        index[normalize_scan_text(loc, "location").lower()] = gudang
+        zone = loc.split("-")[0].strip().lower() if "-" in loc else ""
+        if zone and zone not in index:
+            index[zone] = gudang
+    with _CACHE_LOCK:
+        _GUDANG_INDEX_CACHE["index"] = index
+        _GUDANG_INDEX_CACHE["expires"] = now + _LOOKUPS_CACHE_TTL
+    return index, False
+
+def resolve_gudang_for_location(location, gudang_index):
+    if not location or not gudang_index:
+        return None
+    loc = str(location).strip()
+    if not loc:
+        return None
+    if loc.lower() in gudang_index:
+        return gudang_index[loc.lower()]
+    norm = normalize_scan_text(loc, "location").lower()
+    if norm in gudang_index:
+        return gudang_index[norm]
+    zone = loc.split("-")[0].strip().lower() if "-" in loc else loc.lower()
+    return gudang_index.get(zone)
+
+def aggregate_counts_by_gudang_sku(records, gudang_index):
+    """Sum physical counts per (gudang, sku) using the location→gudang index."""
+    totals = {}
+    unmapped = set()
+    for row in records:
+        sku = str(row.get("SKU Code", "")).strip()
+        loc = str(row.get("Precise Location", "")).strip()
+        if not sku or not loc:
+            continue
+        gudang = resolve_gudang_for_location(loc, gudang_index)
+        if not gudang:
+            unmapped.add(loc)
+            continue
+        qty = parse_physical_count(row.get("Physical Count"))
+        key = (gudang, sku)
+        totals[key] = totals.get(key, 0) + qty
+    return totals, unmapped
+
+def _is_gudang_stock_column(label):
+    """Match warehouse qty columns; skip totals/subtotals (e.g. 'Total Nama Gudang')."""
+    low = label.lower()
+    if "gudang" not in low:
+        return False
+    if "total" in low or "jumlah" in low or "subtotal" in low:
+        return False
+    return True
+
+def parse_system_stock_excel(file_bytes, sku_lookup=None):
+    """Parse ERP export: gudang names on row 5, SKU in column C from row 6."""
+    # read_only breaks max_row on some ERP exports; load fully for reliable dimensions.
+    wb_xl = load_workbook(BytesIO(file_bytes), data_only=True)
+    ws = wb_xl.active
+    gudang_cols = {}
+    for col in range(1, (ws.max_column or 0) + 1):
+        val = ws.cell(row=_EXCEL_GUDANG_ROW, column=col).value
+        if val is None:
+            continue
+        label = normalize_gudang_label(val)
+        if label and _is_gudang_stock_column(label):
+            gudang_cols[col] = label
+    if not gudang_cols:
+        raise ValueError(
+            "Tidak menemukan nama gudang di baris 5. "
+            'Pastikan ada sel seperti "Gudang Finished Goods", "Gudang Raw", dll.'
+        )
+    rows_out = []
+    warnings = []
+    max_row = ws.max_row or _EXCEL_DATA_START_ROW
+    for row_idx in range(_EXCEL_DATA_START_ROW, max_row + 1):
+        raw_sku = ws.cell(row=row_idx, column=_EXCEL_SKU_COL).value
+        if raw_sku is None or str(raw_sku).strip() == "":
+            continue
+        sku = str(raw_sku).strip()
+        if sku_lookup:
+            resolved = resolve_sku(sku, sku_lookup)
+            if resolved:
+                sku = resolved
+            else:
+                warnings.append(f"SKU tidak dikenali (baris {row_idx}): {sku}")
+        for col_idx, gudang in gudang_cols.items():
+            qty = parse_excel_quantity(ws.cell(row=row_idx, column=col_idx).value)
+            if qty == 0:
+                continue
+            rows_out.append({"gudang": gudang, "sku": sku, "system_qty": qty})
+    wb_xl.close()
+    if not rows_out:
+        raise ValueError("Tidak ada baris stok sistem yang terbaca. Periksa kolom Kode Barang (C) dan kuantitas gudang.")
+    return rows_out, warnings
+
+def stock_variance_pct(system_qty, running_qty):
+    gap = running_qty - system_qty
+    if system_qty:
+        return round((gap / system_qty) * 100, 2)
+    if running_qty:
+        return 100.0
+    return 0.0
+
+def get_session_stock_worksheet(wb, session_id, create=False):
+    title = sanitize_worksheet_title(session_id)
+    try:
+        return wb.worksheet(title)
+    except Exception:
+        if not create:
+            return None
+    ws = wb.add_worksheet(title=title, rows=max(len(STOCK_RECON_HEADERS) + 1, 500), cols=len(STOCK_RECON_HEADERS))
+    ws.append_row(list(STOCK_RECON_HEADERS))
+    return ws
+
+def session_stock_tab_exists(wb, session_id):
+    return get_session_stock_worksheet(wb, session_id, create=False) is not None
+
+def write_session_stock_tab(ws, stock_rows, running_by_key):
+    """Rewrite session tab with system stock and computed running/gap/variance."""
+    body = [list(STOCK_RECON_HEADERS)]
+    for item in stock_rows:
+        gudang = item["gudang"]
+        sku = item["sku"]
+        system_qty = int(item.get("system_qty", 0))
+        running = int(running_by_key.get((gudang, sku), 0))
+        gap = running - system_qty
+        variance = stock_variance_pct(system_qty, running)
+        body.append([gudang, sku, system_qty, running, gap, f"{variance}%"])
+    ws.clear()
+    ws.update(body, range_name="A1")
+    return len(body) - 1
+
+def refresh_session_stock_tab(session_id):
+    """Recalculate running count, gap, and variance on an existing session stock tab."""
+    wb = get_spreadsheet_cached()
+    ws = get_session_stock_worksheet(wb, session_id, create=False)
+    if not ws:
+        return {"updated": 0, "skipped": True}
+    try:
+        data = ws.get_all_values()
+    except Exception:
+        return {"updated": 0, "error": "read_failed"}
+    if len(data) < 2:
+        return {"updated": 0}
+    gudang_index, _ = build_gudang_location_index(wb)
+    sheet = wb.worksheet("Raw Counts")
+    records = read_raw_counts_for_summary(sheet, session_id=session_id)
+    running_by_key, _ = aggregate_counts_by_gudang_sku(records, gudang_index)
+    updates = []
+    for i, row in enumerate(data[1:], start=2):
+        padded = list(row) + [""] * 6
+        gudang = normalize_gudang_label(padded[0])
+        sku = str(padded[1]).strip()
+        if not gudang or not sku:
+            continue
+        system_qty = parse_physical_count(padded[2])
+        running = int(running_by_key.get((gudang, sku), 0))
+        gap = running - system_qty
+        variance = stock_variance_pct(system_qty, running)
+        updates.append([running, gap, f"{variance}%"])
+    if not updates:
+        return {"updated": 0}
+    ws.update(updates, range_name=f"D2:F{len(updates) + 1}", value_input_option="USER_ENTERED")
+    return {"updated": len(updates)}
+
+def import_system_stock_for_session(session_id, file_bytes):
+    if not require_valid_session_id(session_id):
+        raise ValueError("Sesi tidak valid.")
+    wb = get_spreadsheet_cached()
+    sku_lookup = load_sku_lookup_cached(wb)
+    stock_rows, warnings = parse_system_stock_excel(file_bytes, sku_lookup=sku_lookup)
+    gudang_index, _ = build_gudang_location_index(wb)
+    sheet = wb.worksheet("Raw Counts")
+    records = read_raw_counts_for_summary(sheet, session_id=session_id)
+    running_by_key, unmapped = aggregate_counts_by_gudang_sku(records, gudang_index)
+    ws = get_session_stock_worksheet(wb, session_id, create=True)
+    row_count = write_session_stock_tab(ws, stock_rows, running_by_key)
+    return {
+        "row_count": row_count,
+        "tab_title": sanitize_worksheet_title(session_id),
+        "warnings": warnings,
+        "unmapped_locations": sorted(unmapped),
+    }
+
+def save_gudang_location_mappings(mappings):
+    wb = get_spreadsheet_cached()
+    ws = ensure_gudang_locations_tab(wb)
+    body = [["Location", "Gudang", "Notes"]]
+    for item in mappings:
+        loc = str(item.get("location", "")).strip()
+        gudang = normalize_gudang_label(item.get("gudang", ""))
+        notes = str(item.get("notes", "")).strip()
+        if loc and gudang:
+            body.append([loc, gudang, notes])
+    ws.clear()
+    ws.update(body, range_name="A1")
+    invalidate_gudang_index_cache()
+    return len(body) - 1
+
+def build_gudang_locations_payload(force_refresh=False):
+    wb = get_spreadsheet_cached()
+    index, from_cache = build_gudang_location_index(wb, force_refresh=force_refresh)
+    mappings = load_gudang_location_mappings(wb)
+    lookups, _ = build_lookups_payload()
+    location_lookup = lookups.get("location_lookup", {})
+    mapped_keys = {m["location"].lower() for m in mappings}
+    unmapped = sorted(
+        loc for loc in set(location_lookup.values())
+        if not resolve_gudang_for_location(loc, index)
+    )
+    return {
+        "mappings": mappings,
+        "unmapped_locations": unmapped,
+        "mapping_count": len(mappings),
+    }, from_cache
+
+def maybe_refresh_session_stock(session_id):
+    if not session_id:
+        return
+    try:
+        wb = get_spreadsheet_cached()
+        if session_stock_tab_exists(wb, session_id):
+            refresh_session_stock_tab(session_id)
+    except Exception:
+        pass
+
 SESSION_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -849,6 +1158,7 @@ SESSION_HTML_TEMPLATE = """
             <p id="sessionError" class="hidden text-sm text-rose-600"></p>
         </div>
         <p class="text-xs text-zinc-400 text-center mt-6">End Session hanya di perangkat ini — tidak menutup sesi di sheet.</p>
+        <p class="text-center mt-3"><a href="/admin/stock" class="text-xs font-semibold text-violet-600 hover:text-violet-800">Admin: upload stok sistem &amp; mapping gudang</a></p>
     </main>
     <script>
         const SESSION_STORAGE_KEY = 'aeris_opname_session';
@@ -2840,6 +3150,247 @@ SUMMARY_HTML_TEMPLATE = """
 </html>
 """
 
+ADMIN_STOCK_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Stock Reconcile — Aeris Opname</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+</head>
+<body class="bg-zinc-50 font-sans text-zinc-900 antialiased min-h-screen">
+    <header class="border-b border-zinc-200 bg-white shadow-sm">
+        <div class="max-w-4xl mx-auto px-4 py-3 flex items-start justify-between gap-4">
+            <div>
+                <h1 class="text-lg font-bold text-zinc-900 tracking-tight">Aeris Beaute</h1>
+                <p class="text-xs text-zinc-500">Admin — stok sistem vs opname</p>
+            </div>
+            <nav class="flex flex-col items-end gap-1 text-xs font-semibold shrink-0">
+                <a href="/" class="text-zinc-500 hover:text-violet-700">Sessions</a>
+                <a href="/dashboard" class="text-zinc-500 hover:text-violet-700">Dashboard</a>
+            </nav>
+        </div>
+    </header>
+    <main class="max-w-4xl mx-auto px-4 py-8 space-y-8">
+        <section class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
+            <h2 class="text-base font-bold text-zinc-900">Upload stok sistem (Excel)</h2>
+            <p class="text-sm text-zinc-600">
+                File ERP: nama gudang di <strong>baris 5</strong>, SKU di <strong>kolom C</strong> (Kode Barang) mulai baris 6.
+                Tab baru di Google Sheet akan dibuat dengan nama <strong>Session ID</strong>.
+            </p>
+            <div class="grid gap-4 sm:grid-cols-2">
+                <div>
+                    <label for="sessionSelect" class="block text-sm font-semibold text-zinc-700 mb-2">Session</label>
+                    <select id="sessionSelect" class="w-full border border-zinc-200 rounded-lg px-3 py-2.5 text-sm bg-white focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                        <option value="">Memuat sesi…</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="excelFile" class="block text-sm font-semibold text-zinc-700 mb-2">File Excel (.xlsx)</label>
+                    <input id="excelFile" type="file" accept=".xlsx,.xlsm"
+                        class="w-full border border-zinc-200 rounded-lg px-3 py-2 text-sm file:mr-3 file:py-1 file:px-3 file:rounded-md file:border-0 file:bg-violet-50 file:text-violet-700 file:font-semibold">
+                </div>
+            </div>
+            <button type="button" id="uploadBtn" onclick="uploadStock()"
+                class="w-full sm:w-auto px-5 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white text-sm font-semibold">
+                Upload &amp; buat tab sesi
+            </button>
+            <p id="uploadStatus" class="hidden text-sm"></p>
+            <ul id="uploadWarnings" class="hidden text-sm text-amber-700 list-disc pl-5 space-y-1"></ul>
+        </section>
+
+        <section class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+                <h2 class="text-base font-bold text-zinc-900">Indeks lokasi → gudang</h2>
+                <button type="button" onclick="loadGudangMappings()" class="text-xs font-semibold text-violet-700 hover:text-violet-900">Refresh</button>
+            </div>
+            <p class="text-sm text-zinc-600">
+                Petakan kode lokasi (atau zone) dari tab LOCATIONS ke nama gudang di file Excel.
+                Running count per SKU akan dijumlahkan per gudang berdasarkan mapping ini.
+            </p>
+            <div id="unmappedBox" class="hidden rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"></div>
+            <div class="overflow-x-auto border border-zinc-200 rounded-lg">
+                <table class="min-w-full text-sm">
+                    <thead class="bg-zinc-50 text-zinc-600">
+                        <tr>
+                            <th class="px-3 py-2 text-left font-semibold">Location / Zone</th>
+                            <th class="px-3 py-2 text-left font-semibold">Gudang</th>
+                            <th class="px-3 py-2 text-left font-semibold">Notes</th>
+                            <th class="px-3 py-2 w-16"></th>
+                        </tr>
+                    </thead>
+                    <tbody id="mappingBody"></tbody>
+                </table>
+            </div>
+            <div class="flex flex-wrap gap-2">
+                <button type="button" onclick="addMappingRow()" class="px-4 py-2 rounded-lg border border-zinc-300 text-sm font-semibold text-zinc-700 hover:bg-zinc-50">+ Baris</button>
+                <button type="button" onclick="saveMappings()" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold">Simpan mapping</button>
+            </div>
+            <p id="mappingStatus" class="hidden text-sm"></p>
+        </section>
+    </main>
+    <script>
+        let mappingRows = [];
+
+        async function loadSessions() {
+            const sel = document.getElementById('sessionSelect');
+            try {
+                const res = await fetch('/api/sessions');
+                const data = await res.json();
+                const sessions = data.sessions || [];
+                sel.innerHTML = '';
+                if (!sessions.length) {
+                    sel.innerHTML = '<option value="">Tidak ada sesi aktif</option>';
+                    return;
+                }
+                sessions.forEach(s => {
+                    const opt = document.createElement('option');
+                    opt.value = s.id;
+                    opt.textContent = s.name + ' (' + s.id + ')';
+                    sel.appendChild(opt);
+                });
+            } catch (e) {
+                sel.innerHTML = '<option value="">Gagal memuat sesi</option>';
+            }
+        }
+
+        function setStatus(elId, message, kind) {
+            const el = document.getElementById(elId);
+            el.textContent = message;
+            el.classList.remove('hidden', 'text-rose-600', 'text-emerald-700', 'text-zinc-600');
+            if (kind === 'error') el.classList.add('text-rose-600');
+            else if (kind === 'success') el.classList.add('text-emerald-700');
+            else el.classList.add('text-zinc-600');
+        }
+
+        async function uploadStock() {
+            const sessionId = document.getElementById('sessionSelect').value;
+            const fileInput = document.getElementById('excelFile');
+            const btn = document.getElementById('uploadBtn');
+            const warnEl = document.getElementById('uploadWarnings');
+            warnEl.classList.add('hidden');
+            warnEl.innerHTML = '';
+            if (!sessionId) {
+                setStatus('uploadStatus', 'Pilih sesi terlebih dahulu.', 'error');
+                return;
+            }
+            if (!fileInput.files || !fileInput.files[0]) {
+                setStatus('uploadStatus', 'Pilih file Excel (.xlsx).', 'error');
+                return;
+            }
+            btn.disabled = true;
+            setStatus('uploadStatus', 'Mengunggah dan memproses…', 'info');
+            const form = new FormData();
+            form.append('session_id', sessionId);
+            form.append('file', fileInput.files[0]);
+            try {
+                const res = await fetch('/api/admin/stock/upload', { method: 'POST', body: form });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.message || 'Upload gagal');
+                let msg = 'Tab "' + (data.tab_title || sessionId) + '" dibuat/diperbarui dengan ' + data.row_count + ' baris.';
+                if (data.unmapped_locations && data.unmapped_locations.length) {
+                    msg += ' ' + data.unmapped_locations.length + ' lokasi belum terpetakan ke gudang.';
+                }
+                setStatus('uploadStatus', msg, 'success');
+                if (data.warnings && data.warnings.length) {
+                    warnEl.classList.remove('hidden');
+                    data.warnings.slice(0, 20).forEach(w => {
+                        const li = document.createElement('li');
+                        li.textContent = w;
+                        warnEl.appendChild(li);
+                    });
+                }
+            } catch (e) {
+                setStatus('uploadStatus', e.message || 'Upload gagal', 'error');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function renderMappingTable() {
+            const body = document.getElementById('mappingBody');
+            body.innerHTML = '';
+            mappingRows.forEach((row, idx) => {
+                const tr = document.createElement('tr');
+                tr.className = 'border-t border-zinc-100';
+                tr.innerHTML = `
+                    <td class="px-2 py-1"><input data-field="location" data-idx="${idx}" value="${escapeAttr(row.location || '')}" class="w-full border border-zinc-200 rounded px-2 py-1 text-sm"></td>
+                    <td class="px-2 py-1"><input data-field="gudang" data-idx="${idx}" value="${escapeAttr(row.gudang || '')}" class="w-full border border-zinc-200 rounded px-2 py-1 text-sm" placeholder="Gudang Finished Goods"></td>
+                    <td class="px-2 py-1"><input data-field="notes" data-idx="${idx}" value="${escapeAttr(row.notes || '')}" class="w-full border border-zinc-200 rounded px-2 py-1 text-sm"></td>
+                    <td class="px-2 py-1 text-center"><button type="button" data-del="${idx}" class="text-rose-600 text-xs font-semibold">Hapus</button></td>`;
+                body.appendChild(tr);
+            });
+            body.querySelectorAll('input[data-field]').forEach(inp => {
+                inp.addEventListener('input', e => {
+                    const i = parseInt(e.target.dataset.idx, 10);
+                    mappingRows[i][e.target.dataset.field] = e.target.value;
+                });
+            });
+            body.querySelectorAll('button[data-del]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    mappingRows.splice(parseInt(btn.dataset.del, 10), 1);
+                    renderMappingTable();
+                });
+            });
+        }
+
+        function escapeAttr(s) {
+            return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+        }
+
+        function addMappingRow() {
+            mappingRows.push({ location: '', gudang: '', notes: '' });
+            renderMappingTable();
+        }
+
+        async function loadGudangMappings() {
+            try {
+                const res = await fetch('/api/admin/gudang-locations');
+                const data = await res.json();
+                mappingRows = (data.mappings || []).map(m => ({
+                    location: m.location || '',
+                    gudang: m.gudang || '',
+                    notes: m.notes || ''
+                }));
+                if (!mappingRows.length) mappingRows.push({ location: '', gudang: '', notes: '' });
+                renderMappingTable();
+                const unmapped = data.unmapped_locations || [];
+                const box = document.getElementById('unmappedBox');
+                if (unmapped.length) {
+                    box.classList.remove('hidden');
+                    box.textContent = unmapped.length + ' lokasi belum terpetakan: ' + unmapped.slice(0, 8).join(', ') + (unmapped.length > 8 ? '…' : '');
+                } else {
+                    box.classList.add('hidden');
+                }
+            } catch (e) {
+                setStatus('mappingStatus', 'Gagal memuat mapping.', 'error');
+            }
+        }
+
+        async function saveMappings() {
+            const payload = mappingRows.filter(r => (r.location || '').trim() && (r.gudang || '').trim());
+            try {
+                const res = await fetch('/api/admin/gudang-locations', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mappings: payload })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.message || 'Simpan gagal');
+                setStatus('mappingStatus', 'Mapping disimpan (' + data.mapping_count + ' baris).', 'success');
+                await loadGudangMappings();
+            } catch (e) {
+                setStatus('mappingStatus', e.message || 'Simpan gagal', 'error');
+            }
+        }
+
+        window.onload = () => { loadSessions(); loadGudangMappings(); };
+    </script>
+</body>
+</html>
+"""
+
 # --- ROUTES ---
 
 @app.route('/')
@@ -2952,6 +3503,52 @@ def dashboard_data():
 @app.route('/summary')
 def summary_page():
     return render_template_string(SUMMARY_HTML_TEMPLATE)
+
+@app.route('/admin/stock')
+def admin_stock_page():
+    return render_template_string(ADMIN_STOCK_HTML_TEMPLATE)
+
+@app.route('/api/admin/stock/upload', methods=['POST'])
+def api_admin_stock_upload():
+    try:
+        session_id = str(request.form.get("session_id", "")).strip()
+        if not session_id:
+            return jsonify({"status": "error", "message": "Pilih sesi."}), 400
+        upload = request.files.get("file")
+        if not upload or not upload.filename:
+            return jsonify({"status": "error", "message": "File Excel wajib diunggah."}), 400
+        if not upload.filename.lower().endswith((".xlsx", ".xlsm")):
+            return jsonify({"status": "error", "message": "Format file harus .xlsx atau .xlsm."}), 400
+        result = import_system_stock_for_session(session_id, upload.read())
+        return jsonify({"status": "success", **result}), 200
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/admin/gudang-locations', methods=['GET'])
+def api_admin_gudang_locations_get():
+    try:
+        force_refresh = request.args.get("refresh") in ("1", "true", "yes")
+        payload, from_cache = build_gudang_locations_payload(force_refresh=force_refresh)
+        response = jsonify(payload)
+        if from_cache and not force_refresh:
+            response.headers["Cache-Control"] = f"private, max-age={_LOOKUPS_CACHE_TTL}"
+        return response, 200
+    except Exception as e:
+        return jsonify({"mappings": [], "unmapped_locations": [], "error": str(e)}), 500
+
+@app.route('/api/admin/gudang-locations', methods=['POST'])
+def api_admin_gudang_locations_post():
+    try:
+        data = request.get_json(silent=True) or {}
+        mappings = data.get("mappings") or []
+        if not isinstance(mappings, list):
+            return jsonify({"status": "error", "message": "mappings harus berupa array."}), 400
+        count = save_gudang_location_mappings(mappings)
+        return jsonify({"status": "success", "mapping_count": count}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/summary/data')
 def summary_data():
@@ -3111,6 +3708,7 @@ def submit():
         invalidate_history_cache(counter_name, session_id)
         invalidate_summary_cache(session_id)
         update_dup_index_entry(session_id, counter_name, loc_string, sku_code, physical_count)
+        maybe_refresh_session_stock(session_id)
         return jsonify({"status": "success"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -3130,6 +3728,7 @@ def edit():
         if cell:
             sheet.update_cell(cell.row, 8, new_count)  # Column H: Physical Count
             invalidate_count_caches(session_id=session_id, invalidate_dup=True)
+            maybe_refresh_session_stock(session_id)
             return jsonify({"status": "success"}), 200
         return jsonify({"status": "error", "message": "Record row not found"}), 404
     except Exception as e:
@@ -3149,6 +3748,7 @@ def delete():
         if cell:
             sheet.delete_rows(cell.row)
             invalidate_count_caches(session_id=session_id or None, invalidate_dup=True)
+            maybe_refresh_session_stock(session_id)
             return jsonify({"status": "success"}), 200
         return jsonify({"status": "error", "message": "Record row not found"}), 404
     except Exception as e:
