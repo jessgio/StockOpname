@@ -945,6 +945,17 @@ def _is_gudang_stock_column(label):
         return False
     return True
 
+def _is_excel_summary_sku_row(sku):
+    """Skip ERP footer/summary rows (e.g. 'Total Kode Barang')."""
+    low = " ".join(str(sku or "").strip().lower().split())
+    if not low:
+        return True
+    if low == "total kode barang":
+        return True
+    if low.startswith("total") and "kode" in low:
+        return True
+    return False
+
 def parse_system_stock_excel(file_bytes, sku_lookup=None):
     """Parse ERP export: gudang names on row 5, SKU in column C from row 6."""
     # read_only breaks max_row on some ERP exports; load fully for reliable dimensions.
@@ -963,20 +974,26 @@ def parse_system_stock_excel(file_bytes, sku_lookup=None):
             "Tidak menemukan nama gudang di baris 5. "
             'Pastikan ada sel seperti "Gudang Finished Goods", "Gudang Raw", dll.'
         )
+    if not sku_lookup:
+        wb_xl.close()
+        raise ValueError("Daftar SKU tidak tersedia. Periksa tab SKU List di sheet sebelum upload.")
     rows_out = []
     warnings = []
+    excluded_unrecognized = 0
     max_row = ws.max_row or _EXCEL_DATA_START_ROW
     for row_idx in range(_EXCEL_DATA_START_ROW, max_row + 1):
         raw_sku = ws.cell(row=row_idx, column=_EXCEL_SKU_COL).value
         if raw_sku is None or str(raw_sku).strip() == "":
             continue
         sku = str(raw_sku).strip()
-        if sku_lookup:
-            resolved = resolve_sku(sku, sku_lookup)
-            if resolved:
-                sku = resolved
-            else:
-                warnings.append(f"SKU tidak dikenali (baris {row_idx}): {sku}")
+        if _is_excel_summary_sku_row(sku):
+            continue
+        resolved = resolve_sku(sku, sku_lookup)
+        if not resolved:
+            excluded_unrecognized += 1
+            warnings.append(f"SKU tidak dikenali (baris {row_idx}): {sku}")
+            continue
+        sku = resolved
         for col_idx, gudang in gudang_cols.items():
             qty = parse_excel_quantity(ws.cell(row=row_idx, column=col_idx).value)
             if qty == 0:
@@ -984,8 +1001,11 @@ def parse_system_stock_excel(file_bytes, sku_lookup=None):
             rows_out.append({"gudang": gudang, "sku": sku, "system_qty": qty})
     wb_xl.close()
     if not rows_out:
-        raise ValueError("Tidak ada baris stok sistem yang terbaca. Periksa kolom Kode Barang (C) dan kuantitas gudang.")
-    return rows_out, warnings
+        raise ValueError(
+            "Tidak ada baris stok sistem yang terbaca. "
+            "Pastikan SKU ada di tab SKU List dan kuantitas gudang tidak nol."
+        )
+    return rows_out, warnings, excluded_unrecognized
 
 def stock_variance_pct(system_qty, running_qty):
     gap = running_qty - system_qty
@@ -1062,7 +1082,9 @@ def import_system_stock_for_session(session_id, file_bytes):
         raise ValueError("Sesi tidak valid.")
     wb = get_spreadsheet_cached()
     sku_lookup = load_sku_lookup_cached(wb)
-    stock_rows, warnings = parse_system_stock_excel(file_bytes, sku_lookup=sku_lookup)
+    stock_rows, warnings, excluded_unrecognized = parse_system_stock_excel(
+        file_bytes, sku_lookup=sku_lookup
+    )
     gudang_index, _ = build_gudang_location_index(wb)
     sheet = wb.worksheet("Raw Counts")
     records = read_raw_counts_for_summary(sheet, session_id=session_id)
@@ -1073,6 +1095,7 @@ def import_system_stock_for_session(session_id, file_bytes):
         "row_count": row_count,
         "tab_title": sanitize_worksheet_title(session_id),
         "warnings": warnings,
+        "excluded_unrecognized": excluded_unrecognized,
         "unmapped_locations": sorted(unmapped),
     }
 
@@ -1097,14 +1120,13 @@ def build_gudang_locations_payload(force_refresh=False):
     mappings = load_gudang_location_mappings(wb)
     lookups, _ = build_lookups_payload()
     location_lookup = lookups.get("location_lookup", {})
-    mapped_keys = {m["location"].lower() for m in mappings}
     unmapped = sorted(
         loc for loc in set(location_lookup.values())
         if not resolve_gudang_for_location(loc, index)
     )
     return {
-        "mappings": mappings,
         "unmapped_locations": unmapped,
+        "all_mapped": len(unmapped) == 0,
         "mapping_count": len(mappings),
     }, from_cache
 
@@ -1158,7 +1180,7 @@ SESSION_HTML_TEMPLATE = """
             <p id="sessionError" class="hidden text-sm text-rose-600"></p>
         </div>
         <p class="text-xs text-zinc-400 text-center mt-6">End Session hanya di perangkat ini — tidak menutup sesi di sheet.</p>
-        <p class="text-center mt-3"><a href="/admin/stock" class="text-xs font-semibold text-violet-600 hover:text-violet-800">Admin: upload stok sistem &amp; mapping gudang</a></p>
+        <p class="text-center mt-3"><a href="/admin/stock" class="text-xs font-semibold text-violet-600 hover:text-violet-800">Admin: upload stok sistem</a></p>
     </main>
     <script>
         const SESSION_STORAGE_KEY = 'aeris_opname_session';
@@ -3177,6 +3199,7 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             <h2 class="text-base font-bold text-zinc-900">Upload stok sistem (Excel)</h2>
             <p class="text-sm text-zinc-600">
                 File ERP: nama gudang di <strong>baris 5</strong>, SKU di <strong>kolom C</strong> (Kode Barang) mulai baris 6.
+                Hanya SKU yang ada di tab <strong>SKU List</strong> yang dimasukkan; baris seperti <strong>Total Kode Barang</strong> diabaikan.
                 Tab baru di Google Sheet akan dibuat dengan nama <strong>Session ID</strong>.
             </p>
             <div class="grid gap-4 sm:grid-cols-2">
@@ -3198,41 +3221,27 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             </button>
             <p id="uploadStatus" class="hidden text-sm"></p>
             <ul id="uploadWarnings" class="hidden text-sm text-amber-700 list-disc pl-5 space-y-1"></ul>
+            <div id="uploadUnmappedBox" class="hidden mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950"></div>
         </section>
 
-        <section class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
+        <section id="setupCheckSection" class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-3">
             <div class="flex flex-wrap items-center justify-between gap-3">
-                <h2 class="text-base font-bold text-zinc-900">Indeks lokasi → gudang</h2>
-                <button type="button" onclick="loadGudangMappings()" class="text-xs font-semibold text-violet-700 hover:text-violet-900">Refresh</button>
+                <h2 class="text-base font-bold text-zinc-900">Pemeriksaan mapping lokasi</h2>
+                <button type="button" onclick="loadUnmappedLocations()" class="text-xs font-semibold text-violet-700 hover:text-violet-900">Periksa ulang</button>
             </div>
             <p class="text-sm text-zinc-600">
-                Petakan kode lokasi (atau zone) dari tab LOCATIONS ke nama gudang di file Excel.
-                Running count per SKU akan dijumlahkan per gudang berdasarkan mapping ini.
+                Mapping lokasi/zone → gudang diatur di tab <strong>GUDANG LOCATIONS</strong> pada Google Sheet (bukan di halaman ini).
             </p>
-            <div id="unmappedBox" class="hidden rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"></div>
-            <div class="overflow-x-auto border border-zinc-200 rounded-lg">
-                <table class="min-w-full text-sm">
-                    <thead class="bg-zinc-50 text-zinc-600">
-                        <tr>
-                            <th class="px-3 py-2 text-left font-semibold">Location / Zone</th>
-                            <th class="px-3 py-2 text-left font-semibold">Gudang</th>
-                            <th class="px-3 py-2 text-left font-semibold">Notes</th>
-                            <th class="px-3 py-2 w-16"></th>
-                        </tr>
-                    </thead>
-                    <tbody id="mappingBody"></tbody>
-                </table>
+            <div id="unmappedOkBox" class="hidden rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+                Semua lokasi di tab LOCATIONS sudah terpetakan ke gudang.
             </div>
-            <div class="flex flex-wrap gap-2">
-                <button type="button" onclick="addMappingRow()" class="px-4 py-2 rounded-lg border border-zinc-300 text-sm font-semibold text-zinc-700 hover:bg-zinc-50">+ Baris</button>
-                <button type="button" onclick="saveMappings()" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold">Simpan mapping</button>
+            <div id="unmappedFlagBox" class="hidden rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950">
+                <p id="unmappedFlagTitle" class="font-semibold mb-2"></p>
+                <ul id="unmappedFlagList" class="list-disc pl-5 space-y-0.5 max-h-48 overflow-y-auto"></ul>
             </div>
-            <p id="mappingStatus" class="hidden text-sm"></p>
         </section>
     </main>
     <script>
-        let mappingRows = [];
-
         async function loadSessions() {
             const sel = document.getElementById('sessionSelect');
             try {
@@ -3264,6 +3273,54 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             else el.classList.add('text-zinc-600');
         }
 
+        function showUnmappedLocations(unmapped, target) {
+            const list = unmapped || [];
+            const okBox = document.getElementById('unmappedOkBox');
+            const flagBox = document.getElementById('unmappedFlagBox');
+            const title = document.getElementById('unmappedFlagTitle');
+            const ul = document.getElementById('unmappedFlagList');
+            const uploadBox = document.getElementById('uploadUnmappedBox');
+            if (target === 'upload') {
+                if (!list.length) {
+                    uploadBox.classList.add('hidden');
+                    uploadBox.innerHTML = '';
+                    return;
+                }
+                uploadBox.classList.remove('hidden');
+                uploadBox.innerHTML = '<p class="font-semibold mb-1">' + list.length +
+                    ' lokasi di hitungan sesi ini belum terpetakan ke gudang:</p><p class="text-xs break-words">' +
+                    list.join(', ') + '</p>';
+                return;
+            }
+            okBox.classList.add('hidden');
+            flagBox.classList.add('hidden');
+            ul.innerHTML = '';
+            if (!list.length) {
+                okBox.classList.remove('hidden');
+                return;
+            }
+            flagBox.classList.remove('hidden');
+            title.textContent = list.length + ' lokasi/zone di tab LOCATIONS belum ada di GUDANG LOCATIONS:';
+            list.forEach(loc => {
+                const li = document.createElement('li');
+                li.textContent = loc;
+                ul.appendChild(li);
+            });
+        }
+
+        async function loadUnmappedLocations() {
+            try {
+                const res = await fetch('/api/admin/gudang-locations?refresh=1');
+                const data = await res.json();
+                showUnmappedLocations(data.unmapped_locations || [], 'setup');
+            } catch (e) {
+                const flagBox = document.getElementById('unmappedFlagBox');
+                flagBox.classList.remove('hidden');
+                document.getElementById('unmappedFlagTitle').textContent = 'Gagal memeriksa mapping lokasi.';
+                document.getElementById('unmappedFlagList').innerHTML = '';
+            }
+        }
+
         async function uploadStock() {
             const sessionId = document.getElementById('sessionSelect').value;
             const fileInput = document.getElementById('excelFile');
@@ -3271,6 +3328,7 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             const warnEl = document.getElementById('uploadWarnings');
             warnEl.classList.add('hidden');
             warnEl.innerHTML = '';
+            document.getElementById('uploadUnmappedBox').classList.add('hidden');
             if (!sessionId) {
                 setStatus('uploadStatus', 'Pilih sesi terlebih dahulu.', 'error');
                 return;
@@ -3289,13 +3347,18 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                 const data = await res.json();
                 if (!res.ok) throw new Error(data.message || 'Upload gagal');
                 let msg = 'Tab "' + (data.tab_title || sessionId) + '" dibuat/diperbarui dengan ' + data.row_count + ' baris.';
-                if (data.unmapped_locations && data.unmapped_locations.length) {
-                    msg += ' ' + data.unmapped_locations.length + ' lokasi belum terpetakan ke gudang.';
+                if (data.excluded_unrecognized) {
+                    msg += ' ' + data.excluded_unrecognized + ' baris SKU tidak dikenali diabaikan.';
                 }
                 setStatus('uploadStatus', msg, 'success');
+                showUnmappedLocations(data.unmapped_locations || [], 'upload');
                 if (data.warnings && data.warnings.length) {
                     warnEl.classList.remove('hidden');
-                    data.warnings.slice(0, 20).forEach(w => {
+                    const note = document.createElement('li');
+                    note.className = 'font-semibold';
+                    note.textContent = 'SKU di bawah tidak dimasukkan ke tab sesi:';
+                    warnEl.appendChild(note);
+                    data.warnings.slice(0, 50).forEach(w => {
                         const li = document.createElement('li');
                         li.textContent = w;
                         warnEl.appendChild(li);
@@ -3308,84 +3371,7 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             }
         }
 
-        function renderMappingTable() {
-            const body = document.getElementById('mappingBody');
-            body.innerHTML = '';
-            mappingRows.forEach((row, idx) => {
-                const tr = document.createElement('tr');
-                tr.className = 'border-t border-zinc-100';
-                tr.innerHTML = `
-                    <td class="px-2 py-1"><input data-field="location" data-idx="${idx}" value="${escapeAttr(row.location || '')}" class="w-full border border-zinc-200 rounded px-2 py-1 text-sm"></td>
-                    <td class="px-2 py-1"><input data-field="gudang" data-idx="${idx}" value="${escapeAttr(row.gudang || '')}" class="w-full border border-zinc-200 rounded px-2 py-1 text-sm" placeholder="Gudang Finished Goods"></td>
-                    <td class="px-2 py-1"><input data-field="notes" data-idx="${idx}" value="${escapeAttr(row.notes || '')}" class="w-full border border-zinc-200 rounded px-2 py-1 text-sm"></td>
-                    <td class="px-2 py-1 text-center"><button type="button" data-del="${idx}" class="text-rose-600 text-xs font-semibold">Hapus</button></td>`;
-                body.appendChild(tr);
-            });
-            body.querySelectorAll('input[data-field]').forEach(inp => {
-                inp.addEventListener('input', e => {
-                    const i = parseInt(e.target.dataset.idx, 10);
-                    mappingRows[i][e.target.dataset.field] = e.target.value;
-                });
-            });
-            body.querySelectorAll('button[data-del]').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    mappingRows.splice(parseInt(btn.dataset.del, 10), 1);
-                    renderMappingTable();
-                });
-            });
-        }
-
-        function escapeAttr(s) {
-            return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
-        }
-
-        function addMappingRow() {
-            mappingRows.push({ location: '', gudang: '', notes: '' });
-            renderMappingTable();
-        }
-
-        async function loadGudangMappings() {
-            try {
-                const res = await fetch('/api/admin/gudang-locations');
-                const data = await res.json();
-                mappingRows = (data.mappings || []).map(m => ({
-                    location: m.location || '',
-                    gudang: m.gudang || '',
-                    notes: m.notes || ''
-                }));
-                if (!mappingRows.length) mappingRows.push({ location: '', gudang: '', notes: '' });
-                renderMappingTable();
-                const unmapped = data.unmapped_locations || [];
-                const box = document.getElementById('unmappedBox');
-                if (unmapped.length) {
-                    box.classList.remove('hidden');
-                    box.textContent = unmapped.length + ' lokasi belum terpetakan: ' + unmapped.slice(0, 8).join(', ') + (unmapped.length > 8 ? '…' : '');
-                } else {
-                    box.classList.add('hidden');
-                }
-            } catch (e) {
-                setStatus('mappingStatus', 'Gagal memuat mapping.', 'error');
-            }
-        }
-
-        async function saveMappings() {
-            const payload = mappingRows.filter(r => (r.location || '').trim() && (r.gudang || '').trim());
-            try {
-                const res = await fetch('/api/admin/gudang-locations', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ mappings: payload })
-                });
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.message || 'Simpan gagal');
-                setStatus('mappingStatus', 'Mapping disimpan (' + data.mapping_count + ' baris).', 'success');
-                await loadGudangMappings();
-            } catch (e) {
-                setStatus('mappingStatus', e.message || 'Simpan gagal', 'error');
-            }
-        }
-
-        window.onload = () => { loadSessions(); loadGudangMappings(); };
+        window.onload = () => { loadSessions(); loadUnmappedLocations(); };
     </script>
 </body>
 </html>
