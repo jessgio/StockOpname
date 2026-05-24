@@ -37,6 +37,7 @@ _DUP_INDEX_CACHE = {}
 _SESSIONS_CACHE = {"sessions": None, "expires": 0.0}
 _HISTORY_CACHE = {}
 _DASHBOARD_CACHE = {"by_session": {}}
+_ASSIGNMENT_INDEX_CACHE = {"payload": None, "expires": 0.0}
 _CACHE_LOCK = Lock()
 _SPREADSHEET_CACHE_TTL = int(os.environ.get("SPREADSHEET_CACHE_SECONDS", "300"))
 _SUMMARY_CACHE_TTL = int(os.environ.get("SUMMARY_CACHE_SECONDS", "30"))
@@ -44,6 +45,7 @@ _DASHBOARD_CACHE_TTL = int(os.environ.get("DASHBOARD_CACHE_SECONDS", "20"))
 _LOOKUPS_CACHE_TTL = int(os.environ.get("LOOKUPS_CACHE_SECONDS", "300"))
 _DUP_INDEX_CACHE_TTL = int(os.environ.get("DUP_INDEX_CACHE_SECONDS", "120"))
 _HISTORY_CACHE_TTL = int(os.environ.get("HISTORY_CACHE_SECONDS", "60"))
+_ASSIGNMENT_CACHE_TTL = int(os.environ.get("ASSIGNMENT_CACHE_SECONDS", "120"))
 HISTORY_SCAN_ROWS = int(os.environ.get("HISTORY_SCAN_ROWS", "6000"))
 HISTORY_MAX_ITEMS = int(os.environ.get("HISTORY_MAX_ITEMS", "300"))
 
@@ -997,6 +999,169 @@ def require_valid_session_id(session_id):
     sessions, _ = build_sessions_payload()
     return session_by_id(sessions, session_id)
 
+def _split_assignment_locations(raw):
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    for sep in ("|", ";", "\n"):
+        text = text.replace(sep, ",")
+    parts = [p.strip() for p in text.split(",")]
+    return [p for p in parts if p]
+
+def _canonical_session_id(raw_session, sessions):
+    token = str(raw_session or "").strip()
+    if not token:
+        return ""
+    for session in sessions:
+        if session["id"] == token:
+            return session["id"]
+    needle = token.lower()
+    for session in sessions:
+        if str(session["name"]).strip().lower() == needle:
+            return session["id"]
+    return token
+
+def _dedupe_keep_order(items):
+    seen = set()
+    ordered = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+def build_assignment_index_payload(force_refresh=False):
+    now = time.time()
+    if not force_refresh:
+        with _CACHE_LOCK:
+            cached = _ASSIGNMENT_INDEX_CACHE.get("payload")
+            if cached is not None and now < _ASSIGNMENT_INDEX_CACHE.get("expires", 0):
+                return cached, True
+
+    wb = get_spreadsheet_cached()
+    ws = get_worksheet_by_names(
+        wb,
+        (
+            "PETUGAS ASSIGNMENTS",
+            "Petugas Assignments",
+            "ASSIGNMENTS",
+            "Assignments",
+            "Assigned Locations",
+            "Penugasan",
+            "Tugas Petugas",
+        ),
+    )
+    if not ws:
+        payload = {
+            "sheet_available": False,
+            "sheet_name": "",
+            "by_session_counter": {},
+            "by_counter": {},
+        }
+        with _CACHE_LOCK:
+            _ASSIGNMENT_INDEX_CACHE["payload"] = payload
+            _ASSIGNMENT_INDEX_CACHE["expires"] = now + _ASSIGNMENT_CACHE_TTL
+        return payload, False
+
+    try:
+        rows = ws.get_all_values()
+    except Exception:
+        rows = []
+
+    lookups, _ = build_lookups_payload()
+    sessions, _ = build_sessions_payload()
+    counter_lookup = lookups.get("counter_lookup", {})
+    location_lookup = lookups.get("location_lookup", {})
+
+    by_session_counter = {}
+    by_counter = {}
+    if rows:
+        headers = [str(c).strip().lower() for c in rows[0]]
+        session_idx = _header_column_index(headers, ("session id", "session", "session name", "sesi", "nama sesi"))
+        counter_idx = _header_column_index(
+            headers,
+            ("counter", "counter name", "nama petugas", "petugas", "name", "counter team"),
+        )
+        location_idx = _header_column_index(
+            headers,
+            ("location", "locations", "assigned location", "assigned locations", "lokasi", "kode lokasi", "precise location"),
+        )
+
+        if session_idx is None:
+            session_idx = 0
+        if counter_idx is None:
+            counter_idx = 1
+        if location_idx is None:
+            location_idx = 2
+
+        location_columns = [
+            i for i, h in enumerate(headers)
+            if "location" in h or "lokasi" in h or "assigned" in h
+        ]
+        if not location_columns:
+            location_columns = [location_idx]
+
+        for row in rows[1:]:
+            padded = list(row) + [""] * 8
+            raw_counter = str(padded[counter_idx]).strip() if counter_idx < len(padded) else ""
+            if not raw_counter:
+                continue
+            counter_name = resolve_counter(raw_counter, counter_lookup) or raw_counter
+            raw_session = str(padded[session_idx]).strip() if session_idx < len(padded) else ""
+            session_id = _canonical_session_id(raw_session, sessions)
+
+            raw_locations = []
+            for idx in location_columns:
+                if idx < len(padded):
+                    raw_locations.extend(_split_assignment_locations(padded[idx]))
+            if not raw_locations and location_idx < len(padded):
+                raw_locations = _split_assignment_locations(padded[location_idx])
+            if not raw_locations:
+                continue
+
+            resolved_locations = [
+                resolve_location(loc, location_lookup) or loc
+                for loc in raw_locations
+            ]
+            resolved_locations = _dedupe_keep_order(resolved_locations)
+            if not resolved_locations:
+                continue
+
+            if session_id:
+                key = f"{session_id}|{counter_name}"
+                existing = by_session_counter.get(key, [])
+                by_session_counter[key] = _dedupe_keep_order(existing + resolved_locations)
+            else:
+                existing = by_counter.get(counter_name, [])
+                by_counter[counter_name] = _dedupe_keep_order(existing + resolved_locations)
+
+    payload = {
+        "sheet_available": True,
+        "sheet_name": ws.title,
+        "by_session_counter": by_session_counter,
+        "by_counter": by_counter,
+    }
+    with _CACHE_LOCK:
+        _ASSIGNMENT_INDEX_CACHE["payload"] = payload
+        _ASSIGNMENT_INDEX_CACHE["expires"] = now + _ASSIGNMENT_CACHE_TTL
+    return payload, False
+
+def build_assigned_locations_payload(session_id, counter_name, force_refresh=False):
+    assignment_index, from_cache = build_assignment_index_payload(force_refresh=force_refresh)
+    key = f"{session_id}|{counter_name}"
+    session_locations = assignment_index.get("by_session_counter", {}).get(key, [])
+    global_locations = assignment_index.get("by_counter", {}).get(counter_name, [])
+    locations = _dedupe_keep_order(list(session_locations) + list(global_locations))
+    return {
+        "session_id": session_id,
+        "counter_name": counter_name,
+        "sheet_available": assignment_index.get("sheet_available", False),
+        "sheet_name": assignment_index.get("sheet_name", ""),
+        "locations": locations,
+        "assignment_count": len(locations),
+    }, from_cache
+
 def resolve_sku(code, sku_lookup):
     """Match scanned or typed SKU to a canonical code in the SKU lookup."""
     if not code or not sku_lookup:
@@ -1712,6 +1877,16 @@ HTML_TEMPLATE = """
                     </div>
                 </section>
 
+                <section id="assignedLocationsCard" class="step-card">
+                    <div class="step-card__head step-card__head--idle">
+                        <h2 class="step-card__title step-card__title--idle flex-1">Lokasi Tugas Sesi Ini</h2>
+                        <button type="button" onclick="fetchAssignedLocations(true)" class="text-xs font-semibold text-violet-600 hover:text-violet-800">Refresh</button>
+                    </div>
+                    <div id="assignedLocationsContainer" class="p-4 pt-3 space-y-2 text-sm">
+                        <p class="text-zinc-400 text-center py-2">Scan badge atau ketik nama petugas.</p>
+                    </div>
+                </section>
+
                 <!-- Step 2: Lokasi -->
                 <section id="step2Card" class="step-card step-locked" aria-disabled="true">
                     <div id="step2CardHead" class="step-card__head step-card__head--idle">
@@ -1870,6 +2045,7 @@ HTML_TEMPLATE = """
         let locationFrozen = false;
         let scannerRunning = false;
         let lastHandledScan = { key: '', at: 0, target: '' };
+        let lastAssignmentFetchKey = '';
         let html5QrcodeScanner = null;
         const COUNTER_PREFIXES = [
             'counter:', 'counter name:', 'name:', 'nama:', 'nama petugas:',
@@ -2298,6 +2474,7 @@ HTML_TEMPLATE = """
             const counterInput = document.getElementById('counterName');
             const locInput = document.getElementById('location');
             const historyContainer = document.getElementById('historyContainer');
+            const assignmentContainer = document.getElementById('assignedLocationsContainer');
 
             if (isValidCounter(counterInput.value)) {
                 counterInput.className = CLS.counterUnlocked;
@@ -2330,6 +2507,7 @@ HTML_TEMPLATE = """
                     lockSkuFields();
                     locInput.className = CLS.locLocked;
                 }
+                maybeFetchAssignedLocations();
                 if (refreshHistory) maybeFetchHistory();
             } else {
                 counterInput.className = CLS.counterLocked;
@@ -2341,6 +2519,10 @@ HTML_TEMPLATE = """
                 unfreezeLocation();
                 lockSkuFields();
                 historyContainer.innerHTML = '<p class="text-zinc-400 text-center py-8">Scan badge atau ketik nama petugas.</p>';
+                if (assignmentContainer) {
+                    assignmentContainer.innerHTML = '<p class="text-zinc-400 text-center py-2">Scan badge atau ketik nama petugas.</p>';
+                }
+                lastAssignmentFetchKey = '';
             }
             updateStepperUI();
             updateSubmitState();
@@ -2477,6 +2659,14 @@ HTML_TEMPLATE = """
             if (!isHistoryPanelVisible()) return;
             if (!isValidCounter(document.getElementById('counterName').value)) return;
             fetchHistory(forceRefresh);
+        }
+
+        function maybeFetchAssignedLocations(forceRefresh = false) {
+            const counterName = resolveCounter(document.getElementById('counterName').value) || '';
+            if (!counterName) return;
+            const key = `${activeSession.sessionId}|${counterName}`;
+            if (!forceRefresh && lastAssignmentFetchKey === key) return;
+            fetchAssignedLocations(forceRefresh);
         }
 
         window.addEventListener('resize', () => {
@@ -2839,6 +3029,7 @@ HTML_TEMPLATE = """
         window.switchTab = switchTab;
         window.submitData = submitData;
         window.fetchHistory = fetchHistory;
+        window.fetchAssignedLocations = fetchAssignedLocations;
         window.adjustCount = adjustCount;
 
         function adjustCount(amount) {
@@ -2856,6 +3047,60 @@ HTML_TEMPLATE = """
                 .replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;')
                 .replace(/"/g, '&quot;');
+        }
+
+        async function fetchAssignedLocations(forceRefresh = false) {
+            const counterName = resolveCounter(document.getElementById('counterName').value) || '';
+            const container = document.getElementById('assignedLocationsContainer');
+            if (!container) return;
+
+            if (!counterName) {
+                container.innerHTML = '<p class="text-zinc-400 text-center py-2">Scan badge atau ketik nama petugas.</p>';
+                lastAssignmentFetchKey = '';
+                return;
+            }
+
+            const fetchKey = `${activeSession.sessionId}|${counterName}`;
+            if (!forceRefresh && lastAssignmentFetchKey === fetchKey) return;
+
+            container.innerHTML = '<p class="text-zinc-400 text-center py-2 animate-pulse">Memuat lokasi tugas…</p>';
+            try {
+                const qs = new URLSearchParams({
+                    session_id: activeSession.sessionId,
+                    counter_name: counterName,
+                });
+                if (forceRefresh) qs.set('refresh', '1');
+                const response = await fetch(`/api/assigned-locations?${qs.toString()}`);
+                const payload = await response.json();
+                if (!response.ok) {
+                    throw new Error(payload.error || 'Fetch failed');
+                }
+
+                const locations = Array.isArray(payload.locations) ? payload.locations : [];
+                if (!locations.length) {
+                    const hint = payload.sheet_available
+                        ? 'Belum ada lokasi tugas untuk petugas ini di sesi aktif.'
+                        : 'Sheet PETUGAS ASSIGNMENTS belum tersedia.';
+                    container.innerHTML = `<p class="text-zinc-500 text-center py-2">${escapeHtml(hint)}</p>`;
+                    lastAssignmentFetchKey = fetchKey;
+                    return;
+                }
+
+                const chips = locations
+                    .map((loc) => `<span class="inline-flex items-center px-2.5 py-1 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-900 font-semibold text-xs">${escapeHtml(loc)}</span>`)
+                    .join('');
+                container.innerHTML = `
+                    <div class="flex items-center justify-between gap-2">
+                        <p class="text-xs text-zinc-500">Petugas: <span class="font-semibold text-zinc-700">${escapeHtml(counterName)}</span></p>
+                        <p class="text-xs font-semibold text-emerald-700">${locations.length} lokasi</p>
+                    </div>
+                    <div class="flex flex-wrap gap-2 pt-1">${chips}</div>
+                `;
+                lastAssignmentFetchKey = fetchKey;
+            } catch (err) {
+                container.innerHTML = '<p class="text-rose-600 text-center py-2">Gagal memuat lokasi tugas.</p>';
+                lastAssignmentFetchKey = '';
+            }
         }
 
         async function fetchHistory(forceRefresh = false) {
@@ -3997,6 +4242,57 @@ def api_lookups():
             "warnings": [],
             "assignments": {},
             "enforced_session_ids": [],
+            "error": str(e),
+        }), 500
+
+@app.route('/api/assigned-locations')
+def api_assigned_locations():
+    try:
+        session_id = request.args.get("session_id", "").strip()
+        raw_counter_name = request.args.get("counter_name", "").strip()
+        if not session_id or not raw_counter_name:
+            return jsonify({
+                "session_id": session_id,
+                "counter_name": raw_counter_name,
+                "sheet_available": False,
+                "sheet_name": "",
+                "locations": [],
+                "assignment_count": 0,
+            }), 200
+        if not require_valid_session_id(session_id):
+            return jsonify({"error": "Invalid session"}), 400
+
+        lookups, _ = build_lookups_payload()
+        counter_lookup = lookups.get("counter_lookup", {})
+        counter_name = resolve_counter(raw_counter_name, counter_lookup)
+        if not counter_name:
+            return jsonify({
+                "session_id": session_id,
+                "counter_name": raw_counter_name,
+                "sheet_available": True,
+                "sheet_name": "",
+                "locations": [],
+                "assignment_count": 0,
+            }), 200
+
+        force_refresh = request.args.get("refresh") in ("1", "true", "yes")
+        payload, from_cache = build_assigned_locations_payload(
+            session_id,
+            counter_name,
+            force_refresh=force_refresh,
+        )
+        response = jsonify(payload)
+        if from_cache and not force_refresh:
+            response.headers["Cache-Control"] = f"private, max-age={_ASSIGNMENT_CACHE_TTL}"
+        return response, 200
+    except Exception as e:
+        return jsonify({
+            "session_id": "",
+            "counter_name": "",
+            "sheet_available": False,
+            "sheet_name": "",
+            "locations": [],
+            "assignment_count": 0,
             "error": str(e),
         }), 500
 
