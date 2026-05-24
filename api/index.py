@@ -1218,6 +1218,36 @@ STOCK_RECON_HEADERS = ("Gudang", "SKU", "System Qty", "Running Count", "Gap", "V
 _EXCEL_GUDANG_ROW = 5
 _EXCEL_SKU_COL = 3
 _EXCEL_DATA_START_ROW = 6
+_EXCEL_SKU_HEADER_NAMES = ("kode barang", "sku code", "sku", "kode")
+
+def _is_excel_sku_header(label):
+    low = " ".join(str(label or "").strip().lower().split())
+    if not low:
+        return False
+    if low in _EXCEL_SKU_HEADER_NAMES:
+        return True
+    return "kode" in low and "barang" in low
+
+def detect_excel_stock_layout(ws):
+    """Find SKU column and gudang columns from the header row (default row 5)."""
+    header_row = _EXCEL_GUDANG_ROW
+    sku_col = None
+    gudang_cols = {}
+    for col in range(1, (ws.max_column or 0) + 1):
+        val = ws.cell(row=header_row, column=col).value
+        if val is None:
+            continue
+        label = normalize_gudang_label(val)
+        if not label:
+            continue
+        if sku_col is None and _is_excel_sku_header(label):
+            sku_col = col
+            continue
+        if _is_gudang_stock_column(label):
+            gudang_cols[col] = label
+    if sku_col is None:
+        sku_col = _EXCEL_SKU_COL
+    return header_row, sku_col, gudang_cols
 
 def sanitize_worksheet_title(name):
     s = str(name or "").strip()
@@ -1353,19 +1383,13 @@ def _is_excel_summary_sku_row(sku):
     return False
 
 def parse_system_stock_excel(file_bytes, sku_lookup=None):
-    """Parse ERP export: gudang names on row 5, SKU in column C from row 6."""
+    """Parse ERP export: header row 5 with Kode Barang + Gudang columns; data from row 6."""
     # read_only breaks max_row on some ERP exports; load fully for reliable dimensions.
     wb_xl = load_workbook(BytesIO(file_bytes), data_only=True)
     ws = wb_xl.active
-    gudang_cols = {}
-    for col in range(1, (ws.max_column or 0) + 1):
-        val = ws.cell(row=_EXCEL_GUDANG_ROW, column=col).value
-        if val is None:
-            continue
-        label = normalize_gudang_label(val)
-        if label and _is_gudang_stock_column(label):
-            gudang_cols[col] = label
+    header_row, sku_col, gudang_cols = detect_excel_stock_layout(ws)
     if not gudang_cols:
+        wb_xl.close()
         raise ValueError(
             "Tidak menemukan nama gudang di baris 5. "
             'Pastikan ada sel seperti "Gudang Finished Goods", "Gudang Raw", dll.'
@@ -1376,9 +1400,10 @@ def parse_system_stock_excel(file_bytes, sku_lookup=None):
     rows_out = []
     warnings = []
     excluded_unrecognized = 0
-    max_row = ws.max_row or _EXCEL_DATA_START_ROW
-    for row_idx in range(_EXCEL_DATA_START_ROW, max_row + 1):
-        raw_sku = ws.cell(row=row_idx, column=_EXCEL_SKU_COL).value
+    data_start = header_row + 1
+    max_row = ws.max_row or data_start
+    for row_idx in range(data_start, max_row + 1):
+        raw_sku = ws.cell(row=row_idx, column=sku_col).value
         if raw_sku is None or str(raw_sku).strip() == "":
             continue
         sku = str(raw_sku).strip()
@@ -3774,7 +3799,8 @@ ADMIN_STOCK_HTML_TEMPLATE = """
         <section class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
             <h2 class="text-base font-bold text-zinc-900">Upload stok sistem (Excel)</h2>
             <p class="text-sm text-zinc-600">
-                File ERP: nama gudang di <strong>baris 5</strong>, SKU di <strong>kolom C</strong> (Kode Barang) mulai baris 6.
+                File ERP: baris <strong>5</strong> berisi <strong>Kode Barang</strong> dan nama gudang; data mulai baris 6
+                (kolom SKU terdeteksi otomatis, biasanya kolom A atau C).
                 Hanya SKU yang ada di tab <strong>SKU List</strong> yang dimasukkan; baris seperti <strong>Total Kode Barang</strong> diabaikan.
                 Tab baru di Google Sheet akan dibuat dengan nama <strong>Session ID</strong>.
                 Hitungan fisik (Raw Counts) untuk pasangan gudang/SKU yang tidak ada di file ERP ditambahkan dengan <strong>System Qty 0</strong>
