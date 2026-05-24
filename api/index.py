@@ -1411,6 +1411,58 @@ def stock_variance_pct(system_qty, running_qty):
         return 100.0
     return 0.0
 
+def session_stock_key(gudang, sku):
+    """Normalized (gudang, sku) for ERP rows and running-count lookups."""
+    return (normalize_gudang_label(gudang), str(sku or "").strip())
+
+def normalized_running_by_key(running_by_key):
+    """Merge running totals under normalized (gudang, sku) keys."""
+    merged = {}
+    for gudang, sku in running_by_key:
+        key = session_stock_key(gudang, sku)
+        if not key[0] or not key[1]:
+            continue
+        merged[key] = merged.get(key, 0) + int(running_by_key[(gudang, sku)])
+    return merged
+
+def build_session_stock_body(stock_rows, running_by_key):
+    """
+    ERP file rows first, then append (gudang, sku) from physical counts that are not
+    in the upload (system qty 0) — e.g. SKU missing for a gudang or gudang omitted as empty.
+    """
+    running = normalized_running_by_key(running_by_key)
+    body = [list(STOCK_RECON_HEADERS)]
+    erp_keys = set()
+
+    for item in stock_rows:
+        key = session_stock_key(item.get("gudang"), item.get("sku"))
+        if not key[0] or not key[1]:
+            continue
+        if key in erp_keys:
+            continue
+        erp_keys.add(key)
+        gudang, sku = key
+        system_qty = int(item.get("system_qty", 0))
+        run_qty = int(running.get(key, 0))
+        gap = run_qty - system_qty
+        variance = stock_variance_pct(system_qty, run_qty)
+        body.append([gudang, sku, system_qty, run_qty, gap, f"{variance}%"])
+
+    physical_only = 0
+    for key in sorted(running.keys()):
+        if key in erp_keys:
+            continue
+        run_qty = int(running.get(key, 0))
+        if run_qty <= 0:
+            continue
+        gudang, sku = key
+        gap = run_qty
+        variance = stock_variance_pct(0, run_qty)
+        body.append([gudang, sku, 0, run_qty, gap, f"{variance}%"])
+        physical_only += 1
+
+    return body, physical_only
+
 def get_session_stock_worksheet(wb, session_id, create=False):
     title = sanitize_worksheet_title(session_id)
     try:
@@ -1426,22 +1478,31 @@ def session_stock_tab_exists(wb, session_id):
     return get_session_stock_worksheet(wb, session_id, create=False) is not None
 
 def write_session_stock_tab(ws, stock_rows, running_by_key):
-    """Rewrite session tab with system stock and computed running/gap/variance."""
-    body = [list(STOCK_RECON_HEADERS)]
-    for item in stock_rows:
-        gudang = item["gudang"]
-        sku = item["sku"]
-        system_qty = int(item.get("system_qty", 0))
-        running = int(running_by_key.get((gudang, sku), 0))
-        gap = running - system_qty
-        variance = stock_variance_pct(system_qty, running)
-        body.append([gudang, sku, system_qty, running, gap, f"{variance}%"])
+    """Rewrite session tab with ERP rows plus physical-only (gudang, sku) append rows."""
+    body, physical_only = build_session_stock_body(stock_rows, running_by_key)
     ws.clear()
     ws.update(body, range_name="A1")
-    return len(body) - 1
+    return len(body) - 1, physical_only
+
+def stock_rows_from_session_tab_data(data):
+    """Rebuild ERP row list from an existing session stock tab (preserves system qty)."""
+    stock_rows = []
+    seen = set()
+    for row in data[1:]:
+        padded = list(row) + [""] * 6
+        key = session_stock_key(padded[0], padded[1])
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        stock_rows.append({
+            "gudang": key[0],
+            "sku": key[1],
+            "system_qty": parse_physical_count(padded[2]),
+        })
+    return stock_rows
 
 def refresh_session_stock_tab(session_id):
-    """Recalculate running count, gap, and variance on an existing session stock tab."""
+    """Recalculate session tab from stored system qty plus latest physical counts."""
     wb = get_spreadsheet_cached()
     ws = get_session_stock_worksheet(wb, session_id, create=False)
     if not ws:
@@ -1456,22 +1517,14 @@ def refresh_session_stock_tab(session_id):
     sheet = wb.worksheet("Raw Counts")
     records = read_raw_counts_for_summary(sheet, session_id=session_id)
     running_by_key, _ = aggregate_counts_by_gudang_sku(records, gudang_index)
-    updates = []
-    for i, row in enumerate(data[1:], start=2):
-        padded = list(row) + [""] * 6
-        gudang = normalize_gudang_label(padded[0])
-        sku = str(padded[1]).strip()
-        if not gudang or not sku:
-            continue
-        system_qty = parse_physical_count(padded[2])
-        running = int(running_by_key.get((gudang, sku), 0))
-        gap = running - system_qty
-        variance = stock_variance_pct(system_qty, running)
-        updates.append([running, gap, f"{variance}%"])
-    if not updates:
-        return {"updated": 0}
-    ws.update(updates, range_name=f"D2:F{len(updates) + 1}", value_input_option="USER_ENTERED")
-    return {"updated": len(updates)}
+    stock_rows = stock_rows_from_session_tab_data(data)
+    body, physical_only = build_session_stock_body(stock_rows, running_by_key)
+    ws.clear()
+    ws.update(body, range_name="A1")
+    return {
+        "updated": max(0, len(body) - 1),
+        "physical_only_rows": physical_only,
+    }
 
 def import_system_stock_for_session(session_id, file_bytes):
     if not require_valid_session_id(session_id):
@@ -1486,9 +1539,10 @@ def import_system_stock_for_session(session_id, file_bytes):
     records = read_raw_counts_for_summary(sheet, session_id=session_id)
     running_by_key, unmapped = aggregate_counts_by_gudang_sku(records, gudang_index)
     ws = get_session_stock_worksheet(wb, session_id, create=True)
-    row_count = write_session_stock_tab(ws, stock_rows, running_by_key)
+    row_count, physical_only = write_session_stock_tab(ws, stock_rows, running_by_key)
     return {
         "row_count": row_count,
+        "physical_only_rows": physical_only,
         "tab_title": sanitize_worksheet_title(session_id),
         "warnings": warnings,
         "excluded_unrecognized": excluded_unrecognized,
@@ -3723,6 +3777,8 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                 File ERP: nama gudang di <strong>baris 5</strong>, SKU di <strong>kolom C</strong> (Kode Barang) mulai baris 6.
                 Hanya SKU yang ada di tab <strong>SKU List</strong> yang dimasukkan; baris seperti <strong>Total Kode Barang</strong> diabaikan.
                 Tab baru di Google Sheet akan dibuat dengan nama <strong>Session ID</strong>.
+                Hitungan fisik (Raw Counts) untuk pasangan gudang/SKU yang tidak ada di file ERP ditambahkan dengan <strong>System Qty 0</strong>
+                (gudang dari tab <strong>GUDANG LOCATIONS</strong>).
             </p>
             <div class="grid gap-4 sm:grid-cols-2">
                 <div>
@@ -3922,6 +3978,9 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                 const data = await res.json();
                 if (!res.ok) throw new Error(data.message || 'Upload gagal');
                 let msg = 'Tab "' + (data.tab_title || sessionId) + '" dibuat/diperbarui dengan ' + data.row_count + ' baris.';
+                if (data.physical_only_rows) {
+                    msg += ' (' + data.physical_only_rows + ' hanya hitungan fisik, System Qty 0).';
+                }
                 if (data.excluded_unrecognized) {
                     msg += ' ' + data.excluded_unrecognized + ' baris SKU tidak dikenali diabaikan.';
                 }
