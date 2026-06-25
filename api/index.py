@@ -369,6 +369,30 @@ def find_duplicate_count(sheet, session_id, counter_name, loc_string, sku_code):
     index = get_dup_index(sheet, session_id)
     return index.get((counter_name, loc_string, sku_code))
 
+def find_duplicate_excluding(sheet, session_id, counter_name, loc_string, sku_code, exclude_log_id):
+    """Return physical count if another row has the same counter+location+sku in this session."""
+    exclude = str(exclude_log_id or "").strip()
+    for row in read_raw_count_rows(sheet):
+        if str(row.get("Log ID", "")).strip() == exclude:
+            continue
+        if not row_matches_session(row, session_id):
+            continue
+        if get_row_counter_name(row) != counter_name:
+            continue
+        if str(row.get("Precise Location", "")).strip() != loc_string:
+            continue
+        if str(row.get("SKU Code", "")).strip() != sku_code:
+            continue
+        return parse_physical_count(row.get("Physical Count"))
+    return None
+
+def location_parts(loc_string):
+    parts = loc_string.split("-")
+    zone = parts[0] if len(parts) > 0 else loc_string[:1]
+    rack = parts[1] if len(parts) > 1 else ""
+    shelf = parts[2] if len(parts) > 2 else ""
+    return zone, rack, shelf
+
 def build_summary_payload(session_id, force_refresh=False):
     now = time.time()
     if not force_refresh:
@@ -1748,6 +1772,8 @@ HTML_TEMPLATE = """
     <style>
         #scanModal { display: none !important; visibility: hidden !important; pointer-events: none !important; }
         #scanModal.is-open { display: block !important; visibility: visible !important; pointer-events: auto !important; }
+        #editModal { display: none !important; visibility: hidden !important; pointer-events: none !important; }
+        #editModal.is-open { display: block !important; visibility: visible !important; pointer-events: auto !important; }
         #toast { pointer-events: none !important; }
         #step1Card { position: relative; z-index: 1; pointer-events: auto !important; }
         #step1Card input, #step1Card button { pointer-events: auto !important; touch-action: manipulation; }
@@ -2061,6 +2087,51 @@ HTML_TEMPLATE = """
             <div class="p-4 overflow-hidden flex-1 min-h-0">
                 <div id="reader" class="w-full aspect-square max-h-[55vh] mx-auto rounded-xl overflow-hidden bg-black"></div>
                 <p id="scanModalHint" class="text-center text-xs text-zinc-500 mt-3">Arahkan kamera ke QR code</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit history record modal -->
+    <div id="editModal" hidden class="fixed inset-0 z-40" role="dialog" aria-modal="true" aria-labelledby="editModalTitle">
+        <div class="absolute inset-0 bg-black/50" onclick="closeEditModal()"></div>
+        <div class="absolute inset-x-0 bottom-0 max-h-[92vh] flex flex-col bg-white rounded-t-2xl shadow-2xl lg:inset-auto lg:top-1/2 lg:left-1/2 lg:-translate-x-1/2 lg:-translate-y-1/2 lg:w-full lg:max-w-md lg:rounded-2xl">
+            <div class="flex items-center justify-between px-4 py-3 border-b border-zinc-100 shrink-0">
+                <h3 id="editModalTitle" class="text-base font-semibold text-zinc-900">Ubah catatan</h3>
+                <button type="button" onclick="closeEditModal()" class="text-sm font-medium text-zinc-500 hover:text-zinc-800 px-2 py-1">Batal</button>
+            </div>
+            <div class="p-4 space-y-4 overflow-y-auto">
+                <input type="hidden" id="editLogId" value="">
+                <div>
+                    <label for="editLocation" class="block text-sm font-medium text-zinc-700 mb-1.5">Lokasi</label>
+                    <div class="flex gap-2">
+                        <input type="text" id="editLocation" autocomplete="off"
+                            class="opname-field flex-1 min-w-0 border border-zinc-200 p-3 rounded-lg text-zinc-900 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                        <button type="button" onclick="openScanModal('editLocation')"
+                            class="shrink-0 px-4 py-3 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-sm font-semibold">Scan</button>
+                    </div>
+                </div>
+                <div>
+                    <label for="editSku" class="block text-sm font-medium text-zinc-700 mb-1.5">Kode SKU</label>
+                    <div class="flex gap-2">
+                        <input type="text" id="editSku" autocomplete="off"
+                            class="opname-field flex-1 min-w-0 border border-zinc-200 p-3 rounded-lg text-zinc-900 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                        <button type="button" onclick="openScanModal('editSku')"
+                            class="shrink-0 px-4 py-3 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-sm font-semibold">Scan</button>
+                    </div>
+                </div>
+                <div>
+                    <label for="editCount" class="block text-sm font-medium text-zinc-700 mb-1.5">Jumlah</label>
+                    <div class="flex items-center justify-center gap-2">
+                        <button type="button" onclick="adjustEditCount(-1)" class="flex h-10 w-10 items-center justify-center rounded-full bg-zinc-100 hover:bg-zinc-200 text-lg font-bold text-zinc-800">−</button>
+                        <input type="number" id="editCount" min="0"
+                            class="w-24 border border-zinc-200 rounded-xl text-center text-2xl font-bold tabular-nums text-zinc-900 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                        <button type="button" onclick="adjustEditCount(1)" class="flex h-10 w-10 items-center justify-center rounded-full bg-violet-600 hover:bg-violet-700 text-lg font-bold text-white">+</button>
+                    </div>
+                </div>
+                <button type="button" id="editSaveBtn" onclick="saveEdit()"
+                    class="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-zinc-300 disabled:cursor-not-allowed text-white font-semibold text-base py-3 rounded-xl shadow-sm active:scale-[0.98] transition">
+                    Simpan perubahan
+                </button>
             </div>
         </div>
     </div>
@@ -3036,11 +3107,15 @@ HTML_TEMPLATE = """
                 counter: 'Scan ID badge',
                 location: 'Scan lokasi',
                 sku: 'Scan SKU',
+                editLocation: 'Scan lokasi',
+                editSku: 'Scan SKU',
             };
             const scanHints = {
                 counter: 'Arahkan kamera ke QR pada ID badge petugas',
                 location: 'Arahkan kamera ke QR lokasi',
                 sku: 'Arahkan kamera ke QR SKU',
+                editLocation: 'Arahkan kamera ke QR lokasi',
+                editSku: 'Arahkan kamera ke QR SKU',
             };
             document.getElementById('scanModalTitle').textContent = scanTitles[target] || 'Scan QR';
             document.getElementById('scanModalHint').textContent = scanHints[target] || 'Arahkan kamera ke QR code';
@@ -3075,9 +3150,14 @@ HTML_TEMPLATE = """
                             shouldClose = await applyCounterScan(text);
                         } else if (currentTarget === 'location') {
                             shouldClose = applyLocationScan(text);
+                        } else if (currentTarget === 'editLocation') {
+                            shouldClose = applyEditLocationScan(text);
                         } else if (currentTarget === 'sku') {
                             if (!skuIndexLoaded) await ensureSkuIndex();
                             shouldClose = applySkuScan(text);
+                        } else if (currentTarget === 'editSku') {
+                            if (!skuIndexLoaded) await ensureSkuIndex();
+                            shouldClose = applyEditSkuScan(text);
                         }
                         if (shouldClose) {
                             markScanHandled(text, currentTarget);
@@ -3099,7 +3179,9 @@ HTML_TEMPLATE = """
             modal.hidden = true;
             modal.classList.remove('is-open');
             modal.style.display = 'none';
-            document.body.style.overflow = '';
+            if (!document.getElementById('editModal').classList.contains('is-open')) {
+                document.body.style.overflow = '';
+            }
         }
 
         window.openScanModal = openScanModal;
@@ -3110,6 +3192,10 @@ HTML_TEMPLATE = """
         window.fetchHistory = fetchHistory;
         window.fetchAssignedLocations = fetchAssignedLocations;
         window.adjustCount = adjustCount;
+        window.editItem = editItem;
+        window.closeEditModal = closeEditModal;
+        window.saveEdit = saveEdit;
+        window.adjustEditCount = adjustEditCount;
 
         function adjustCount(amount) {
             const countInput = document.getElementById('count');
@@ -3220,7 +3306,7 @@ HTML_TEMPLATE = """
                             </div>
                         </div>
                         <div class="flex gap-2 mt-2 pt-2 border-t border-zinc-100">
-                            <button type="button" onclick="editItem('${escapeHtml(item.id)}', ${parseInt(item.count) || 0})" class="text-xs font-medium text-amber-700 hover:text-amber-900">Edit</button>
+                            <button type="button" onclick="editItem(${JSON.stringify(item.id)}, ${JSON.stringify(item.location)}, ${JSON.stringify(item.sku)}, ${Number(item.count) || 0})" class="text-xs font-medium text-amber-700 hover:text-amber-900">Edit</button>
                             <button type="button" onclick="deleteItem('${escapeHtml(item.id)}')" class="text-xs font-medium text-rose-600 hover:text-rose-800">Delete</button>
                         </div>
                     </div>
@@ -3307,23 +3393,120 @@ HTML_TEMPLATE = """
             }
         }
 
-        async function editItem(logId, currentCount) {
-            const newCount = prompt(`Enter new physical count for this row:`, currentCount);
-            if (newCount === null || newCount.trim() === "" || isNaN(newCount)) return;
-            
+        async function editItem(logId, location, sku, count) {
+            document.getElementById('editLogId').value = logId;
+            document.getElementById('editLocation').value = location || '';
+            document.getElementById('editSku').value = sku || '';
+            document.getElementById('editCount').value = Number(count) || 0;
+            const modal = document.getElementById('editModal');
+            modal.hidden = false;
+            modal.classList.add('is-open');
+            modal.style.display = 'block';
+            document.body.style.overflow = 'hidden';
+            if (!skuIndexLoaded) await ensureSkuIndex();
+        }
+
+        function closeEditModal() {
+            const modal = document.getElementById('editModal');
+            modal.hidden = true;
+            modal.classList.remove('is-open');
+            modal.style.display = 'none';
+            if (!document.getElementById('scanModal').classList.contains('is-open')) {
+                document.body.style.overflow = '';
+            }
+        }
+
+        function adjustEditCount(amount) {
+            const input = document.getElementById('editCount');
+            let val = parseInt(input.value) || 0;
+            val += amount;
+            if (val < 0) val = 0;
+            input.value = val;
+        }
+
+        function applyEditLocationScan(text) {
+            if (!Object.keys(locationLookup).length) {
+                showToast('Daftar lokasi belum dimuat. Hubungi admin.', 'error');
+                return false;
+            }
+            const resolved = resolveLocation(text);
+            if (!resolved) {
+                const scanned = normalizeScanText(text, 'location') || String(text).trim();
+                showToast(`Lokasi tidak dikenali: "${scanned.slice(0, 40)}".`, 'warning');
+                return false;
+            }
+            const counterName = document.getElementById('counterName').value;
+            if (!isLocationAllowedForPetugas(counterName, resolved)) {
+                showToast(assignmentBlockMessage(counterName), 'warning');
+                return false;
+            }
+            document.getElementById('editLocation').value = resolved;
+            return true;
+        }
+
+        function applyEditSkuScan(text) {
+            const resolved = resolveSku(text) || resolveSku(normalizeScanText(text));
+            if (!resolved) {
+                const scanned = normalizeScanText(text) || String(text).trim();
+                showToast(`SKU tidak dikenali: "${scanned.slice(0, 40)}".`, 'warning');
+                return false;
+            }
+            document.getElementById('editSku').value = resolved;
+            return true;
+        }
+
+        async function saveEdit() {
+            const logId = document.getElementById('editLogId').value;
+            const locInput = document.getElementById('editLocation').value;
+            const skuInput = document.getElementById('editSku').value;
+            const countInput = document.getElementById('editCount').value;
+            const btn = document.getElementById('editSaveBtn');
+
+            const resolvedLocation = resolveLocation(locInput);
+            const resolvedSku = resolveSku(skuInput);
+
+            if (!resolvedLocation || !resolvedSku || countInput === '') {
+                showToast('Lengkapi lokasi, SKU, dan jumlah.', 'warning');
+                return;
+            }
+
+            const counterName = document.getElementById('counterName').value;
+            if (!isLocationAllowedForPetugas(counterName, resolvedLocation)) {
+                showToast(assignmentBlockMessage(counterName), 'warning');
+                return;
+            }
+
+            btn.disabled = true;
             try {
                 const response = await fetch('/edit', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id: logId, count: parseInt(newCount), session_id: activeSession.sessionId })
+                    body: JSON.stringify({
+                        id: logId,
+                        location: resolvedLocation,
+                        sku: resolvedSku,
+                        count: parseInt(countInput, 10),
+                        session_id: activeSession.sessionId,
+                    }),
                 });
-                if (response.ok) {
+                const result = await response.json();
+                if (response.status === 409) {
+                    showToast(result.message || 'Data duplikat.', 'warning');
+                } else if (response.status === 403) {
+                    showToast(result.message || 'Lokasi tidak ditugaskan untuk petugas ini.', 'warning');
+                } else if (response.status === 400) {
+                    showToast(result.message || 'Data tidak valid.', 'warning');
+                } else if (response.ok) {
+                    showToast('Catatan diperbarui.', 'success');
+                    closeEditModal();
                     maybeFetchHistory(true);
                 } else {
-                    alert('Failed to update record on sheet.');
+                    showToast(result.message || 'Gagal memperbarui catatan.', 'error');
                 }
             } catch (err) {
-                alert('Network error, update aborted.');
+                showToast('Network error. Try again.', 'error');
+            } finally {
+                btn.disabled = false;
             }
         }
 
@@ -4629,12 +4812,8 @@ def submit():
             }), 409
 
         # Process standard row generation if duplicate test passes
-        log_id = str(uuid.uuid4()) 
-        parts = loc_string.split('-')
-        
-        zone = parts[0] if len(parts) > 0 else loc_string[:1]
-        rack = parts[1] if len(parts) > 1 else ""
-        shelf = parts[2] if len(parts) > 2 else ""
+        log_id = str(uuid.uuid4())
+        zone, rack, shelf = location_parts(loc_string)
         
         jakarta_tz = pytz.timezone('Asia/Jakarta')
         now_wib = datetime.now(jakarta_tz)
@@ -4675,20 +4854,120 @@ def submit():
 def edit():
     try:
         data = request.json
-        log_id = data['id']
-        new_count = data['count']
+        log_id = str(data.get("id", "")).strip()
+        if not log_id:
+            return jsonify({"status": "error", "message": "ID catatan tidak valid."}), 400
+
         session_id = str(data.get("session_id", "")).strip() or None
-        
+        if session_id and not require_valid_session_id(session_id):
+            return jsonify({"status": "error", "message": "Sesi tidak valid."}), 400
+
         wb = get_spreadsheet_cached()
         sheet = wb.worksheet("Raw Counts")
         cell = sheet.find(log_id)
-        
-        if cell:
-            sheet.update_cell(cell.row, 8, new_count)  # Column H: Physical Count
-            invalidate_count_caches(session_id=session_id, invalidate_dup=True)
-            maybe_refresh_session_stock(session_id)
-            return jsonify({"status": "success"}), 200
-        return jsonify({"status": "error", "message": "Record row not found"}), 404
+        if not cell:
+            return jsonify({"status": "error", "message": "Record row not found"}), 404
+
+        row_num = cell.row
+        row_values = sheet.get(f"A{row_num}:K{row_num}")
+        if not row_values:
+            return jsonify({"status": "error", "message": "Record row not found"}), 404
+        existing = _row_dict_from_padded(list(row_values[0]) + [""] * 11)
+
+        row_session = str(existing.get("Session ID", "")).strip()
+        if session_id and row_session != session_id:
+            return jsonify({"status": "error", "message": "Catatan tidak termasuk sesi aktif."}), 403
+
+        counter_name = get_row_counter_name(existing)
+        if not counter_name:
+            return jsonify({"status": "error", "message": "Petugas pada catatan tidak valid."}), 400
+
+        lookups, _ = build_lookups_payload()
+        location_lookup = lookups["location_lookup"]
+        counter_lookup = lookups["counter_lookup"]
+
+        if "location" in data:
+            loc_string = resolve_location(data.get("location", ""), location_lookup)
+            if not location_lookup:
+                return jsonify({
+                    "status": "error",
+                    "message": "Daftar lokasi tidak tersedia. Periksa tab LOCATIONS di sheet.",
+                }), 400
+            if not loc_string:
+                raw = str(data.get("location", "")).strip()
+                return jsonify({
+                    "status": "invalid_location",
+                    "message": f"Lokasi tidak valid: {raw}. Scan QR lokasi yang benar.",
+                }), 400
+        else:
+            loc_string = str(existing.get("Precise Location", "")).strip()
+
+        ok, assignment_msg = validate_petugas_location_assignment(
+            row_session,
+            counter_name,
+            loc_string,
+            lookups.get("assignments") or {},
+            lookups.get("enforced_session_ids") or [],
+            counter_lookup,
+        )
+        if not ok:
+            return jsonify({
+                "status": "location_not_assigned",
+                "message": assignment_msg,
+            }), 403
+
+        if "sku" in data:
+            sku_lookup = load_sku_lookup_cached(wb)
+            if not sku_lookup:
+                return jsonify({
+                    "status": "error",
+                    "message": "Daftar SKU tidak tersedia. Periksa tab SKU List di sheet.",
+                }), 400
+            sku_code = resolve_sku(data.get("sku", ""), sku_lookup)
+            if not sku_code:
+                raw_sku = str(data.get("sku", "")).strip()
+                return jsonify({
+                    "status": "invalid_sku",
+                    "message": f"SKU tidak valid: {raw_sku}. Pilih atau scan SKU dari daftar.",
+                }), 400
+        else:
+            sku_code = str(existing.get("SKU Code", "")).strip()
+
+        try:
+            new_count = int(data["count"])
+        except (ValueError, TypeError, KeyError):
+            return jsonify({"status": "error", "message": "Jumlah tidak valid."}), 400
+        if new_count < 0:
+            return jsonify({"status": "error", "message": "Jumlah tidak boleh negatif."}), 400
+
+        dup_count = find_duplicate_excluding(
+            sheet, row_session, counter_name, loc_string, sku_code, log_id
+        )
+        if dup_count is not None:
+            return jsonify({
+                "status": "duplicate",
+                "message": (
+                    f"Sudah tercatat: {sku_code} di {loc_string} "
+                    f"(jumlah {dup_count}). "
+                    f"Ubah catatan yang ada atau hapus duplikat."
+                ),
+            }), 409
+
+        zone, rack, shelf = location_parts(loc_string)
+        jakarta_tz = pytz.timezone("Asia/Jakarta")
+        timestamp = datetime.now(jakarta_tz).strftime("%d/%m/%Y %H:%M:%S")
+
+        sheet.update(
+            f"C{row_num}:I{row_num}",
+            [[zone, rack, shelf, loc_string, sku_code, new_count, timestamp]],
+        )
+        invalidate_count_caches(
+            counter_name=counter_name,
+            session_id=row_session or session_id,
+            invalidate_dup=True,
+        )
+        maybe_refresh_session_stock(row_session or session_id)
+        return jsonify({"status": "success"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
