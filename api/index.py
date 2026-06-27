@@ -18,15 +18,38 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
+DEFAULT_SPREADSHEET_NAME = "Aeris Beaute - Stock Opname Master Template"
+
 def get_spreadsheet():
     creds_raw = os.environ.get("GOOGLE_CREDENTIALS")
     if not creds_raw:
         raise RuntimeError("GOOGLE_CREDENTIALS environment variable is missing!")
-    
+
     creds_dict = json.loads(creds_raw)
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     client = gspread.authorize(creds)
-    return client.open("Aeris Beaute - Stock Opname Master Template")
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID", "").strip()
+    if spreadsheet_id:
+        return client.open_by_key(spreadsheet_id)
+    spreadsheet_name = os.environ.get("SPREADSHEET_NAME", DEFAULT_SPREADSHEET_NAME).strip()
+    return client.open(spreadsheet_name or DEFAULT_SPREADSHEET_NAME)
+
+def _admin_token_from_request():
+    token = request.headers.get("X-Admin-Token", "").strip()
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
+    return token
+
+def require_admin_auth():
+    """Return a Flask error response if admin token is required but missing/invalid."""
+    expected = os.environ.get("ADMIN_TOKEN", "").strip()
+    if not expected:
+        return None
+    if _admin_token_from_request() != expected:
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    return None
 
 _SPREADSHEET_CACHE = {"wb": None, "expires": 0.0}
 _SUMMARY_CACHE = {"by_session": {}, "expires": 0.0}
@@ -37,15 +60,17 @@ _DUP_INDEX_CACHE = {}
 _SESSIONS_CACHE = {"sessions": None, "expires": 0.0}
 _HISTORY_CACHE = {}
 _DASHBOARD_CACHE = {"by_session": {}}
-_ASSIGNMENT_INDEX_CACHE = {"payload": None, "expires": 0.0}
+_LOG_ID_ROW_CACHE = {"map": None, "expires": 0.0}
+_STOCK_REFRESH_LAST = {}
 _CACHE_LOCK = Lock()
 _SPREADSHEET_CACHE_TTL = int(os.environ.get("SPREADSHEET_CACHE_SECONDS", "300"))
 _SUMMARY_CACHE_TTL = int(os.environ.get("SUMMARY_CACHE_SECONDS", "30"))
-_DASHBOARD_CACHE_TTL = int(os.environ.get("DASHBOARD_CACHE_SECONDS", "20"))
+_DASHBOARD_CACHE_TTL = int(os.environ.get("DASHBOARD_CACHE_SECONDS", "60"))
 _LOOKUPS_CACHE_TTL = int(os.environ.get("LOOKUPS_CACHE_SECONDS", "300"))
 _DUP_INDEX_CACHE_TTL = int(os.environ.get("DUP_INDEX_CACHE_SECONDS", "120"))
 _HISTORY_CACHE_TTL = int(os.environ.get("HISTORY_CACHE_SECONDS", "60"))
-_ASSIGNMENT_CACHE_TTL = int(os.environ.get("ASSIGNMENT_CACHE_SECONDS", "120"))
+_LOG_ID_ROW_CACHE_TTL = int(os.environ.get("LOG_ID_ROW_CACHE_SECONDS", "60"))
+_STOCK_REFRESH_SECONDS = int(os.environ.get("STOCK_REFRESH_SECONDS", "45"))
 HISTORY_SCAN_ROWS = int(os.environ.get("HISTORY_SCAN_ROWS", "6000"))
 HISTORY_MAX_ITEMS = int(os.environ.get("HISTORY_MAX_ITEMS", "300"))
 
@@ -109,6 +134,12 @@ def invalidate_count_caches(counter_name=None, session_id=None, invalidate_dup=T
     invalidate_history_cache(counter_name, session_id)
     invalidate_summary_cache(session_id)
     invalidate_dashboard_cache(session_id)
+    invalidate_log_id_row_cache()
+
+def invalidate_log_id_row_cache():
+    with _CACHE_LOCK:
+        _LOG_ID_ROW_CACHE["map"] = None
+        _LOG_ID_ROW_CACHE["expires"] = 0.0
 
 def invalidate_gudang_index_cache():
     with _CACHE_LOCK:
@@ -170,7 +201,17 @@ def _row_dict_from_padded(padded):
 def read_raw_count_rows(sheet, start_row=2, end_row=None):
     """Fetch Raw Counts rows (A–K) for a row range."""
     if end_row is None:
-        end_row = sheet.row_count
+        try:
+            values = sheet.get("A2:K")
+            if not values:
+                return []
+            rows = []
+            for i, row in enumerate(values):
+                padded = list(row) + [""] * 11
+                rows.append(_row_dict_from_padded(padded))
+            return rows
+        except Exception:
+            return []
     if end_row < start_row:
         return []
     try:
@@ -182,6 +223,35 @@ def read_raw_count_rows(sheet, start_row=2, end_row=None):
         padded = list(row) + [""] * 11
         rows.append(_row_dict_from_padded(padded))
     return rows
+
+def build_log_id_row_map(sheet):
+    """Map Log ID (column A) -> sheet row number."""
+    now = time.time()
+    try:
+        values = sheet.get("A2:A")
+    except Exception:
+        values = []
+    mapping = {}
+    for i, row in enumerate(values):
+        cell = str(row[0] if row else "").strip()
+        if cell:
+            mapping[cell] = i + 2
+    with _CACHE_LOCK:
+        _LOG_ID_ROW_CACHE["map"] = mapping
+        _LOG_ID_ROW_CACHE["expires"] = now + _LOG_ID_ROW_CACHE_TTL
+    return mapping
+
+def find_row_by_log_id(sheet, log_id):
+    log_id = str(log_id or "").strip()
+    if not log_id:
+        return None
+    now = time.time()
+    with _CACHE_LOCK:
+        cached = _LOG_ID_ROW_CACHE.get("map")
+        if cached is not None and now < _LOG_ID_ROW_CACHE.get("expires", 0):
+            return cached.get(log_id)
+    mapping = build_log_id_row_map(sheet)
+    return mapping.get(log_id)
 
 def get_dup_index(sheet, session_id, force_refresh=False):
     """Map (counter, location, sku) -> qty for one session (columns B, F–H, K)."""
@@ -369,21 +439,35 @@ def find_duplicate_count(sheet, session_id, counter_name, loc_string, sku_code):
     index = get_dup_index(sheet, session_id)
     return index.get((counter_name, loc_string, sku_code))
 
-def find_duplicate_excluding(sheet, session_id, counter_name, loc_string, sku_code, exclude_log_id):
+def find_duplicate_excluding(
+    sheet, session_id, counter_name, loc_string, sku_code, exclude_log_id, counter_lookup=None
+):
     """Return physical count if another row has the same counter+location+sku in this session."""
+    dup_count = find_duplicate_count(sheet, session_id, counter_name, loc_string, sku_code)
+    if dup_count is None:
+        return None
     exclude = str(exclude_log_id or "").strip()
-    for row in read_raw_count_rows(sheet):
-        if str(row.get("Log ID", "")).strip() == exclude:
-            continue
-        if not row_matches_session(row, session_id):
-            continue
-        if get_row_counter_name(row) != counter_name:
-            continue
-        if str(row.get("Precise Location", "")).strip() != loc_string:
-            continue
-        if str(row.get("SKU Code", "")).strip() != sku_code:
-            continue
-        return parse_physical_count(row.get("Physical Count"))
+    if not exclude:
+        return dup_count
+    row_num = find_row_by_log_id(sheet, exclude)
+    if not row_num:
+        return dup_count
+    try:
+        row_values = sheet.get(f"A{row_num}:K{row_num}")
+    except Exception:
+        return dup_count
+    if not row_values:
+        return dup_count
+    existing = _row_dict_from_padded(list(row_values[0]) + [""] * 11)
+    lookup = counter_lookup or {}
+    if not row_matches_session(existing, session_id):
+        return dup_count
+    if not row_matches_counter(existing, counter_name, lookup):
+        return dup_count
+    if str(existing.get("Precise Location", "")).strip() != loc_string:
+        return dup_count
+    if str(existing.get("SKU Code", "")).strip() != sku_code:
+        return dup_count
     return None
 
 def location_parts(loc_string):
@@ -737,12 +821,19 @@ ASSIGNMENTS_TAB_NAMES = (
     "PETUGAS ASSIGNMENTS",
     "Petugas Assignments",
     "ASSIGNMENTS",
+    "Assignments",
     "Location Assignments",
+    "Assigned Locations",
     "Penugasan Lokasi",
+    "Penugasan",
+    "Tugas Petugas",
 )
 
+def get_petugas_assignments_worksheet(wb):
+    return get_worksheet_by_names(wb, ASSIGNMENTS_TAB_NAMES)
+
 def load_petugas_assignments(wb):
-    ws = get_worksheet_by_names(wb, ASSIGNMENTS_TAB_NAMES)
+    ws = get_petugas_assignments_worksheet(wb)
     if not ws:
         return []
     try:
@@ -751,20 +842,25 @@ def load_petugas_assignments(wb):
         return []
     if not rows:
         return []
+
     headers = [str(c).strip().lower() for c in rows[0]]
     session_idx = _header_column_index(
-        headers, ("session id", "session_id", "id sesi", "sesi id")
+        headers,
+        ("session id", "session_id", "id sesi", "sesi id", "session", "session name", "sesi", "nama sesi"),
     )
     counter_idx = _header_column_index(
         headers,
         (
             "petugas", "counter", "counter name", "nama", "nama petugas",
-            "name", "id badge", "badge",
+            "name", "id badge", "badge", "counter team",
         ),
     )
     location_idx = _header_column_index(
         headers,
-        ("location", "lokasi", "precise location", "kode lokasi", "zone", "lokasi ditugaskan"),
+        (
+            "location", "locations", "assigned location", "assigned locations",
+            "lokasi", "precise location", "kode lokasi", "zone", "lokasi ditugaskan",
+        ),
     )
     if session_idx is None:
         session_idx = 0
@@ -772,17 +868,38 @@ def load_petugas_assignments(wb):
         counter_idx = 1
     if location_idx is None:
         location_idx = 2
+
+    location_columns = [
+        i for i, h in enumerate(headers)
+        if "location" in h or "lokasi" in h or "assigned" in h
+    ]
+    if not location_columns:
+        location_columns = [location_idx]
+
+    sessions, _ = build_sessions_payload()
     out = []
     for row in rows[1:]:
-        padded = list(row) + ["", "", ""]
-        session_id = str(padded[session_idx]).strip()
-        counter = str(padded[counter_idx]).strip()
-        location = str(padded[location_idx]).strip()
-        if session_id and counter and location:
+        padded = list(row) + [""] * 8
+        raw_counter = str(padded[counter_idx]).strip() if counter_idx < len(padded) else ""
+        if not raw_counter:
+            continue
+        raw_session = str(padded[session_idx]).strip() if session_idx < len(padded) else ""
+        session_id = _canonical_session_id(raw_session, sessions) if raw_session else ""
+
+        raw_locations = []
+        for idx in location_columns:
+            if idx < len(padded):
+                raw_locations.extend(_split_assignment_locations(padded[idx]))
+        if not raw_locations and location_idx < len(padded):
+            raw_locations = _split_assignment_locations(padded[location_idx])
+        if not raw_locations:
+            continue
+
+        for raw_location in raw_locations:
             out.append({
                 "session_id": session_id,
-                "counter": counter,
-                "location": location,
+                "counter": raw_counter,
+                "location": raw_location,
             })
     return out
 
@@ -790,6 +907,7 @@ def build_assignments_payload(wb, counter_lookup, location_lookup):
     """Per-session petugas→locations map. Sessions with no rows are not enforced."""
     rows = load_petugas_assignments(wb)
     by_session = {}
+    global_by_counter = {}
     enforced_session_ids = set()
     warnings = []
     for item in rows:
@@ -799,34 +917,44 @@ def build_assignments_payload(wb, counter_lookup, location_lookup):
         counter = resolve_counter(raw_counter, counter_lookup)
         location = resolve_location(raw_location, location_lookup)
         if raw_counter and counter_lookup and not counter:
+            label = session_id or "global"
             warnings.append(
-                f"PETUGAS ASSIGNMENTS: petugas tidak di COUNTERS — {raw_counter!r} (sesi {session_id})"
+                f"PETUGAS ASSIGNMENTS: petugas tidak di COUNTERS — {raw_counter!r} (sesi {label})"
             )
             continue
         if raw_location and location_lookup and not location:
+            label = session_id or "global"
             warnings.append(
-                f"PETUGAS ASSIGNMENTS: lokasi tidak di LOCATIONS — {raw_location!r} (sesi {session_id})"
+                f"PETUGAS ASSIGNMENTS: lokasi tidak di LOCATIONS — {raw_location!r} (sesi {label})"
             )
             continue
         if not counter or not location:
             continue
-        enforced_session_ids.add(session_id)
         counter_key = counter.lower()
-        by_session.setdefault(session_id, {}).setdefault(counter_key, set()).add(location)
+        if session_id:
+            enforced_session_ids.add(session_id)
+            by_session.setdefault(session_id, {}).setdefault(counter_key, set()).add(location)
+        else:
+            global_by_counter.setdefault(counter_key, set()).add(location)
+
     assignments = {
         sid: {ck: sorted(locs) for ck, locs in counters.items()}
         for sid, counters in by_session.items()
     }
+    global_assignments = {
+        ck: sorted(locs) for ck, locs in global_by_counter.items()
+    }
     return (
         {
             "assignments": assignments,
+            "global_assignments": global_assignments,
             "enforced_session_ids": sorted(enforced_session_ids),
         },
         warnings,
     )
 
 def ensure_petugas_assignments_tab(wb):
-    ws = get_worksheet_by_names(wb, ASSIGNMENTS_TAB_NAMES)
+    ws = get_petugas_assignments_worksheet(wb)
     if ws:
         return ws
     ws = wb.add_worksheet(title="PETUGAS ASSIGNMENTS", rows=500, cols=3)
@@ -932,14 +1060,19 @@ def session_has_assignment_enforcement(session_id, enforced_session_ids):
     return session_id in enforced_session_ids
 
 def validate_petugas_location_assignment(
-    session_id, counter_name, loc_string, assignments, enforced_session_ids, counter_lookup
+    session_id, counter_name, loc_string, assignments, enforced_session_ids, counter_lookup,
+    global_assignments=None,
 ):
     if not session_has_assignment_enforcement(session_id, enforced_session_ids):
         return True, None
     canonical = resolve_counter(counter_name, counter_lookup) or counter_name
     counter_key = canonical.lower()
     session_map = assignments.get(session_id) or {}
-    allowed = session_map.get(counter_key) or []
+    allowed = list(session_map.get(counter_key) or [])
+    global_map = global_assignments or {}
+    for loc in global_map.get(counter_key) or []:
+        if loc not in allowed:
+            allowed.append(loc)
     if not allowed:
         return False, (
             f"Petugas {canonical} belum ditugaskan lokasi untuk sesi ini. "
@@ -1055,133 +1188,21 @@ def _dedupe_keep_order(items):
         ordered.append(item)
     return ordered
 
-def build_assignment_index_payload(force_refresh=False):
-    now = time.time()
-    if not force_refresh:
-        with _CACHE_LOCK:
-            cached = _ASSIGNMENT_INDEX_CACHE.get("payload")
-            if cached is not None and now < _ASSIGNMENT_INDEX_CACHE.get("expires", 0):
-                return cached, True
-
-    wb = get_spreadsheet_cached()
-    ws = get_worksheet_by_names(
-        wb,
-        (
-            "PETUGAS ASSIGNMENTS",
-            "Petugas Assignments",
-            "ASSIGNMENTS",
-            "Assignments",
-            "Assigned Locations",
-            "Penugasan",
-            "Tugas Petugas",
-        ),
-    )
-    if not ws:
-        payload = {
-            "sheet_available": False,
-            "sheet_name": "",
-            "by_session_counter": {},
-            "by_counter": {},
-        }
-        with _CACHE_LOCK:
-            _ASSIGNMENT_INDEX_CACHE["payload"] = payload
-            _ASSIGNMENT_INDEX_CACHE["expires"] = now + _ASSIGNMENT_CACHE_TTL
-        return payload, False
-
-    try:
-        rows = ws.get_all_values()
-    except Exception:
-        rows = []
-
-    lookups, _ = build_lookups_payload()
-    sessions, _ = build_sessions_payload()
-    counter_lookup = lookups.get("counter_lookup", {})
-    location_lookup = lookups.get("location_lookup", {})
-
-    by_session_counter = {}
-    by_counter = {}
-    if rows:
-        headers = [str(c).strip().lower() for c in rows[0]]
-        session_idx = _header_column_index(headers, ("session id", "session", "session name", "sesi", "nama sesi"))
-        counter_idx = _header_column_index(
-            headers,
-            ("counter", "counter name", "nama petugas", "petugas", "name", "counter team"),
-        )
-        location_idx = _header_column_index(
-            headers,
-            ("location", "locations", "assigned location", "assigned locations", "lokasi", "kode lokasi", "precise location"),
-        )
-
-        if session_idx is None:
-            session_idx = 0
-        if counter_idx is None:
-            counter_idx = 1
-        if location_idx is None:
-            location_idx = 2
-
-        location_columns = [
-            i for i, h in enumerate(headers)
-            if "location" in h or "lokasi" in h or "assigned" in h
-        ]
-        if not location_columns:
-            location_columns = [location_idx]
-
-        for row in rows[1:]:
-            padded = list(row) + [""] * 8
-            raw_counter = str(padded[counter_idx]).strip() if counter_idx < len(padded) else ""
-            if not raw_counter:
-                continue
-            counter_name = resolve_counter(raw_counter, counter_lookup) or raw_counter
-            raw_session = str(padded[session_idx]).strip() if session_idx < len(padded) else ""
-            session_id = _canonical_session_id(raw_session, sessions)
-
-            raw_locations = []
-            for idx in location_columns:
-                if idx < len(padded):
-                    raw_locations.extend(_split_assignment_locations(padded[idx]))
-            if not raw_locations and location_idx < len(padded):
-                raw_locations = _split_assignment_locations(padded[location_idx])
-            if not raw_locations:
-                continue
-
-            resolved_locations = [
-                resolve_location(loc, location_lookup) or loc
-                for loc in raw_locations
-            ]
-            resolved_locations = _dedupe_keep_order(resolved_locations)
-            if not resolved_locations:
-                continue
-
-            if session_id:
-                key = f"{session_id}|{counter_name}"
-                existing = by_session_counter.get(key, [])
-                by_session_counter[key] = _dedupe_keep_order(existing + resolved_locations)
-            else:
-                existing = by_counter.get(counter_name, [])
-                by_counter[counter_name] = _dedupe_keep_order(existing + resolved_locations)
-
-    payload = {
-        "sheet_available": True,
-        "sheet_name": ws.title,
-        "by_session_counter": by_session_counter,
-        "by_counter": by_counter,
-    }
-    with _CACHE_LOCK:
-        _ASSIGNMENT_INDEX_CACHE["payload"] = payload
-        _ASSIGNMENT_INDEX_CACHE["expires"] = now + _ASSIGNMENT_CACHE_TTL
-    return payload, False
-
 def build_assigned_locations_payload(session_id, counter_name, force_refresh=False):
-    assignment_index, from_cache = build_assignment_index_payload(force_refresh=force_refresh)
-    key = f"{session_id}|{counter_name}"
-    session_locations = assignment_index.get("by_session_counter", {}).get(key, [])
-    global_locations = assignment_index.get("by_counter", {}).get(counter_name, [])
-    locations = _dedupe_keep_order(list(session_locations) + list(global_locations))
+    lookups, from_cache = build_lookups_payload(force_refresh=force_refresh)
+    assignments = lookups.get("assignments") or {}
+    global_assignments = lookups.get("global_assignments") or {}
+    counter_key = counter_name.lower()
+    session_locations = list((assignments.get(session_id) or {}).get(counter_key) or [])
+    global_locations = list(global_assignments.get(counter_key) or [])
+    locations = _dedupe_keep_order(session_locations + global_locations)
+    wb = get_spreadsheet_cached()
+    ws = get_petugas_assignments_worksheet(wb)
     return {
         "session_id": session_id,
         "counter_name": counter_name,
-        "sheet_available": assignment_index.get("sheet_available", False),
-        "sheet_name": assignment_index.get("sheet_name", ""),
+        "sheet_available": ws is not None,
+        "sheet_name": ws.title if ws else "",
         "locations": locations,
         "assignment_count": len(locations),
     }, from_cache
@@ -1589,6 +1610,7 @@ def import_system_stock_for_session(session_id, file_bytes):
     running_by_key, unmapped = aggregate_counts_by_gudang_sku(records, gudang_index)
     ws = get_session_stock_worksheet(wb, session_id, create=True)
     row_count, physical_only = write_session_stock_tab(ws, stock_rows, running_by_key)
+    _STOCK_REFRESH_LAST[session_id] = time.time()
     return {
         "row_count": row_count,
         "physical_only_rows": physical_only,
@@ -1627,15 +1649,22 @@ def build_gudang_locations_payload(force_refresh=False):
         "unmapped_locations": unmapped,
         "all_mapped": len(unmapped) == 0,
         "mapping_count": len(mappings),
+        "mappings": mappings,
     }, from_cache
 
-def maybe_refresh_session_stock(session_id):
+def maybe_refresh_session_stock(session_id, force=False):
     if not session_id:
         return
+    now = time.time()
+    if not force:
+        last = _STOCK_REFRESH_LAST.get(session_id, 0.0)
+        if now - last < _STOCK_REFRESH_SECONDS:
+            return
     try:
         wb = get_spreadsheet_cached()
         if session_stock_tab_exists(wb, session_id):
             refresh_session_stock_tab(session_id)
+            _STOCK_REFRESH_LAST[session_id] = now
     except Exception:
         pass
 
@@ -1726,7 +1755,12 @@ SESSION_HTML_TEMPLATE = """
                 const stored = loadStoredSession();
                 if (stored && stored.sessionId) {
                     const match = sessionsList.find(s => s.id === stored.sessionId);
-                    if (match) sel.value = match.id;
+                    if (match) {
+                        sel.value = match.id;
+                        showContinue(stored);
+                    } else {
+                        endStoredSession();
+                    }
                 }
             } catch (e) {
                 err.textContent = 'Gagal memuat daftar sesi.';
@@ -2166,6 +2200,19 @@ HTML_TEMPLATE = """
             window.location.replace('/');
         }
 
+        (async function validateActiveSessionOnLoad() {
+            if (!activeSession || !activeSession.sessionId) return;
+            try {
+                const res = await fetch('/api/sessions');
+                const data = await res.json();
+                const ok = (data.sessions || []).some(s => s.id === activeSession.sessionId);
+                if (!ok) {
+                    localStorage.removeItem(SESSION_STORAGE_KEY);
+                    window.location.replace('/');
+                }
+            } catch (e) {}
+        })();
+
         function sessionQueryParam() {
             return 'session_id=' + encodeURIComponent(activeSession.sessionId);
         }
@@ -2188,6 +2235,7 @@ HTML_TEMPLATE = """
         let counterLookup = _boot.counter_lookup || {};
         let lookupWarnings = _boot.lookup_warnings || [];
         let locationAssignments = _boot.assignments || {};
+        let globalLocationAssignments = _boot.global_assignments || {};
         let enforcedSessionIds = new Set(_boot.enforced_session_ids || []);
         let validLocations = new Set(Object.values(locationLookup));
         let validCounters = new Set(Object.values(counterLookup));
@@ -2239,6 +2287,7 @@ HTML_TEMPLATE = """
             locationLookup = data.locations || {};
             counterLookup = data.counters || {};
             locationAssignments = data.assignments || {};
+            globalLocationAssignments = data.global_assignments || {};
             enforcedSessionIds = new Set(data.enforced_session_ids || []);
             validLocations = new Set(Object.values(locationLookup));
             validCounters = new Set(Object.values(counterLookup));
@@ -2256,8 +2305,15 @@ HTML_TEMPLATE = """
             if (!isAssignmentEnforcedForSession()) return null;
             const resolved = resolveCounter(counterName);
             if (!resolved) return [];
+            const key = resolved.toLowerCase();
             const sess = locationAssignments[activeSession.sessionId] || {};
-            return sess[resolved.toLowerCase()] || [];
+            const sessionLocs = sess[key] || [];
+            const globalLocs = globalLocationAssignments[key] || [];
+            const merged = sessionLocs.slice();
+            globalLocs.forEach(loc => {
+                if (!merged.includes(loc)) merged.push(loc);
+            });
+            return merged;
         }
 
         function assignmentBlockMessage(counterName) {
@@ -2741,6 +2797,7 @@ HTML_TEMPLATE = """
             }
             resetPageInteractionState();
             bindScanButtons();
+            await loadLookups();
             const skuInput = document.getElementById('skuInput');
             if (skuInput) {
                 skuInput.addEventListener('input', onSkuInput);
@@ -3307,7 +3364,7 @@ HTML_TEMPLATE = """
                         </div>
                         <div class="flex gap-2 mt-2 pt-2 border-t border-zinc-100">
                             <button type="button" onclick="editItem(${JSON.stringify(item.id)}, ${JSON.stringify(item.location)}, ${JSON.stringify(item.sku)}, ${Number(item.count) || 0})" class="text-xs font-medium text-amber-700 hover:text-amber-900">Edit</button>
-                            <button type="button" onclick="deleteItem('${escapeHtml(item.id)}')" class="text-xs font-medium text-rose-600 hover:text-rose-800">Delete</button>
+                            <button type="button" onclick="deleteItem(${JSON.stringify(item.id)})" class="text-xs font-medium text-rose-600 hover:text-rose-800">Delete</button>
                         </div>
                     </div>
                 `).join('');
@@ -3316,7 +3373,7 @@ HTML_TEMPLATE = """
                     : '';
                 container.innerHTML = rowsHtml + truncNote;
             } catch (err) {
-                container.innerHTML = '<p class="text-rose-600 text-center py-8">Failed to load history.</p>';
+                container.innerHTML = '<p class="text-rose-600 text-center py-8">Gagal memuat riwayat.</p>';
             }
         }
 
@@ -3377,11 +3434,11 @@ HTML_TEMPLATE = """
                 } else if (response.status === 400) {
                     showToast(result.message || 'Lokasi tidak valid.', 'warning');
                 } else if (response.ok) {
-                    showToast('Count saved successfully.', 'success');
+                    showToast('Catatan berhasil disimpan.', 'success');
                     resetSkuAndCount();
                     maybeFetchHistory(true);
                 } else {
-                    showToast('Sync failed. Try again.', 'error');
+                    showToast('Gagal sinkron. Coba lagi.', 'error');
                 }
             } catch (err) {
                 showToast('Network error. Try again.', 'error');
@@ -3522,10 +3579,10 @@ HTML_TEMPLATE = """
                 if (response.ok) {
                     maybeFetchHistory(true);
                 } else {
-                    alert('Failed to delete record from sheet.');
+                    alert('Gagal menghapus catatan dari sheet.');
                 }
             } catch (err) {
-                alert('Network error, delete aborted.');
+                alert('Kesalahan jaringan, penghapusan dibatalkan.');
             }
         }
     </script>
@@ -3635,7 +3692,7 @@ DASHBOARD_HTML_TEMPLATE = """
 
     <script>
         const SESSION_STORAGE_KEY = 'aeris_opname_session';
-        const POLL_MS = 20000;
+        const POLL_MS = 30000;
         let charts = {};
         let pollTimer = null;
 
@@ -3655,6 +3712,19 @@ DASHBOARD_HTML_TEMPLATE = """
         if (!activeSession || !activeSession.sessionId) {
             window.location.replace('/');
         }
+
+        (async function validateActiveSessionOnLoad() {
+            if (!activeSession || !activeSession.sessionId) return;
+            try {
+                const res = await fetch('/api/sessions');
+                const data = await res.json();
+                const ok = (data.sessions || []).some(s => s.id === activeSession.sessionId);
+                if (!ok) {
+                    localStorage.removeItem(SESSION_STORAGE_KEY);
+                    window.location.replace('/');
+                }
+            } catch (e) {}
+        })();
 
         function fmt(n) {
             return Number(n).toLocaleString('id-ID');
@@ -3822,6 +3892,7 @@ SUMMARY_HTML_TEMPLATE = """
                     <div class="flex flex-wrap gap-3 justify-end">
                         <a href="/count" class="text-zinc-500 hover:text-violet-700">Count</a>
                         <a href="/dashboard" class="text-zinc-500 hover:text-violet-700">Dashboard</a>
+                        <a href="/admin/stock" class="text-zinc-500 hover:text-violet-700">Reconcile</a>
                         <span class="text-violet-700">Summary</span>
                     </div>
                     <p id="summarySessionBadge" class="text-[10px] text-zinc-500 max-w-[10rem] truncate"></p>
@@ -3886,6 +3957,19 @@ SUMMARY_HTML_TEMPLATE = """
         if (!activeSession || !activeSession.sessionId) {
             window.location.replace('/');
         }
+
+        (async function validateActiveSessionOnLoad() {
+            if (!activeSession || !activeSession.sessionId) return;
+            try {
+                const res = await fetch('/api/sessions');
+                const data = await res.json();
+                const ok = (data.sessions || []).some(s => s.id === activeSession.sessionId);
+                if (!ok) {
+                    localStorage.removeItem(SESSION_STORAGE_KEY);
+                    window.location.replace('/');
+                }
+            } catch (e) {}
+        })();
 
         function escapeHtml(str) {
             return String(str)
@@ -3962,7 +4046,7 @@ ADMIN_STOCK_HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-    <title>Stock Reconcile — Aeris Opname</title>
+    <title>Admin — Stok &amp; Penugasan</title>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
 </head>
 <body class="bg-zinc-50 font-sans text-zinc-900 antialiased min-h-screen">
@@ -3979,6 +4063,25 @@ ADMIN_STOCK_HTML_TEMPLATE = """
         </div>
     </header>
     <main class="max-w-4xl mx-auto px-4 py-8 space-y-8">
+        <section class="bg-white rounded-xl border border-violet-200 shadow-sm p-5 space-y-3">
+            <h2 class="text-base font-bold text-zinc-900">Token admin</h2>
+            <p class="text-sm text-zinc-600">
+                Jika <code class="text-xs bg-zinc-100 px-1 rounded">ADMIN_TOKEN</code> dikonfigurasi di Vercel,
+                masukkan token yang sama di sini. Disimpan di perangkat ini (sessionStorage).
+            </p>
+            <div class="flex flex-wrap gap-2 items-end">
+                <div class="flex-1 min-w-[12rem]">
+                    <label for="adminTokenInput" class="block text-sm font-semibold text-zinc-700 mb-1">Admin token</label>
+                    <input id="adminTokenInput" type="password" autocomplete="off" placeholder="X-Admin-Token"
+                        class="w-full border border-zinc-200 rounded-lg px-3 py-2.5 text-sm focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 focus:outline-none">
+                </div>
+                <button type="button" onclick="saveAdminToken()"
+                    class="px-4 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-sm font-semibold">
+                    Simpan token
+                </button>
+            </div>
+            <p id="adminTokenStatus" class="hidden text-sm text-zinc-600"></p>
+        </section>
         <section class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
             <h2 class="text-base font-bold text-zinc-900">Upload stok sistem (Excel)</h2>
             <p class="text-sm text-zinc-600">
@@ -4009,6 +4112,7 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             <p id="uploadStatus" class="hidden text-sm"></p>
             <ul id="uploadWarnings" class="hidden text-sm text-amber-700 list-disc pl-5 space-y-1"></ul>
             <div id="uploadUnmappedBox" class="hidden mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950"></div>
+            <p id="reconcileTabHint" class="hidden text-xs text-zinc-500"></p>
         </section>
 
         <section id="assignmentsSection" class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
@@ -4082,6 +4186,35 @@ ADMIN_STOCK_HTML_TEMPLATE = """
         </section>
     </main>
     <script>
+        const ADMIN_TOKEN_KEY = 'aeris_opname_admin_token';
+
+        function getAdminToken() {
+            return sessionStorage.getItem(ADMIN_TOKEN_KEY) || '';
+        }
+
+        function adminAuthHeaders(extra) {
+            const headers = { ...(extra || {}) };
+            const token = getAdminToken();
+            if (token) headers['X-Admin-Token'] = token;
+            return headers;
+        }
+
+        function saveAdminToken() {
+            const input = document.getElementById('adminTokenInput');
+            const status = document.getElementById('adminTokenStatus');
+            const token = (input.value || '').trim();
+            if (token) sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
+            else sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+            status.textContent = token ? 'Token disimpan untuk sesi browser ini.' : 'Token dihapus.';
+            status.classList.remove('hidden', 'text-rose-600');
+            status.classList.add('text-emerald-700');
+        }
+
+        (function initAdminTokenField() {
+            const input = document.getElementById('adminTokenInput');
+            if (input) input.value = getAdminToken();
+        })();
+
         async function loadSessions() {
             const sel = document.getElementById('sessionSelect');
             try {
@@ -4150,7 +4283,7 @@ ADMIN_STOCK_HTML_TEMPLATE = """
 
         async function loadUnmappedLocations() {
             try {
-                const res = await fetch('/api/admin/gudang-locations?refresh=1');
+                const res = await fetch('/api/admin/gudang-locations?refresh=1', { headers: adminAuthHeaders() });
                 const data = await res.json();
                 showUnmappedLocations(data.unmapped_locations || [], 'setup');
             } catch (e) {
@@ -4183,7 +4316,11 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             form.append('session_id', sessionId);
             form.append('file', fileInput.files[0]);
             try {
-                const res = await fetch('/api/admin/stock/upload', { method: 'POST', body: form });
+                const res = await fetch('/api/admin/stock/upload', {
+                    method: 'POST',
+                    headers: adminAuthHeaders(),
+                    body: form,
+                });
                 const data = await res.json();
                 if (!res.ok) throw new Error(data.message || 'Upload gagal');
                 let msg = 'Tab "' + (data.tab_title || sessionId) + '" dibuat/diperbarui dengan ' + data.row_count + ' baris.';
@@ -4194,6 +4331,11 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                     msg += ' ' + data.excluded_unrecognized + ' baris SKU tidak dikenali diabaikan.';
                 }
                 setStatus('uploadStatus', msg, 'success');
+                const hint = document.getElementById('reconcileTabHint');
+                if (hint && data.tab_title) {
+                    hint.textContent = 'Buka tab reconcile "' + data.tab_title + '" di Google Sheet master untuk melihat System vs Running.';
+                    hint.classList.remove('hidden');
+                }
                 showUnmappedLocations(data.unmapped_locations || [], 'upload');
                 if (data.warnings && data.warnings.length) {
                     warnEl.classList.remove('hidden');
@@ -4329,7 +4471,7 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             body.innerHTML = '<tr><td colspan="4" class="px-3 py-6 text-center text-zinc-400 animate-pulse">Memuat…</td></tr>';
             try {
                 const qs = forceRefresh ? '?refresh=1' : '';
-                const res = await fetch('/api/admin/petugas-assignments' + qs);
+                const res = await fetch('/api/admin/petugas-assignments' + qs, { headers: adminAuthHeaders() });
                 const data = await res.json();
                 assignmentRows = (data.assignments || []).map(r => ({
                     session_id: r.session_id || '',
@@ -4384,7 +4526,7 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             try {
                 const res = await fetch('/api/admin/petugas-assignments', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: adminAuthHeaders({ 'Content-Type': 'application/json' }),
                     body: JSON.stringify(payload),
                 });
                 const data = await res.json();
@@ -4425,36 +4567,15 @@ def session_page():
 
 @app.route('/count')
 def count_page():
-    location_lookup = {}
-    counter_lookup = {}
-    lookup_warnings = []
-    lookups = {}
-    try:
-        lookups, _ = build_lookups_payload()
-        location_lookup = lookups["location_lookup"]
-        counter_lookup = lookups["counter_lookup"]
-        lookup_warnings = lookups["lookup_warnings"]
-    except Exception:
-        lookups = {}
-        location_lookup = location_lookup or {}
-        counter_lookup = counter_lookup or {}
-
     boot_data = {
-        "location_lookup": location_lookup,
-        "counter_lookup": counter_lookup,
-        "lookup_warnings": lookup_warnings,
-        "assignments": lookups.get("assignments") or {},
-        "enforced_session_ids": lookups.get("enforced_session_ids") or [],
+        "location_lookup": {},
+        "counter_lookup": {},
+        "lookup_warnings": [],
+        "assignments": {},
+        "global_assignments": {},
+        "enforced_session_ids": [],
     }
-    return render_template_string(
-        HTML_TEMPLATE,
-        valid_locations=sorted(set(location_lookup.values())),
-        location_lookup=location_lookup,
-        counter_lookup=counter_lookup,
-        valid_counters=sorted(set(counter_lookup.values())),
-        lookup_warnings=lookup_warnings,
-        boot_data=boot_data,
-    )
+    return render_template_string(HTML_TEMPLATE, boot_data=boot_data)
 
 @app.route('/api/sku-codes')
 def api_sku_codes():
@@ -4496,6 +4617,7 @@ def api_lookups():
             "counter_count": len(lookups["counter_lookup"]),
             "warnings": lookups["lookup_warnings"],
             "assignments": lookups.get("assignments") or {},
+            "global_assignments": lookups.get("global_assignments") or {},
             "enforced_session_ids": lookups.get("enforced_session_ids") or [],
         })
         if from_cache and not force_refresh:
@@ -4509,6 +4631,7 @@ def api_lookups():
             "counter_count": 0,
             "warnings": [],
             "assignments": {},
+            "global_assignments": {},
             "enforced_session_ids": [],
             "error": str(e),
         }), 500
@@ -4551,7 +4674,7 @@ def api_assigned_locations():
         )
         response = jsonify(payload)
         if from_cache and not force_refresh:
-            response.headers["Cache-Control"] = f"private, max-age={_ASSIGNMENT_CACHE_TTL}"
+            response.headers["Cache-Control"] = f"private, max-age={_LOOKUPS_CACHE_TTL}"
         return response, 200
     except Exception as e:
         return jsonify({
@@ -4595,6 +4718,9 @@ def admin_stock_page():
 
 @app.route('/api/admin/stock/upload', methods=['POST'])
 def api_admin_stock_upload():
+    auth_err = require_admin_auth()
+    if auth_err:
+        return auth_err
     try:
         session_id = str(request.form.get("session_id", "")).strip()
         if not session_id:
@@ -4613,6 +4739,9 @@ def api_admin_stock_upload():
 
 @app.route('/api/admin/gudang-locations', methods=['GET'])
 def api_admin_gudang_locations_get():
+    auth_err = require_admin_auth()
+    if auth_err:
+        return auth_err
     try:
         force_refresh = request.args.get("refresh") in ("1", "true", "yes")
         payload, from_cache = build_gudang_locations_payload(force_refresh=force_refresh)
@@ -4625,6 +4754,9 @@ def api_admin_gudang_locations_get():
 
 @app.route('/api/admin/gudang-locations', methods=['POST'])
 def api_admin_gudang_locations_post():
+    auth_err = require_admin_auth()
+    if auth_err:
+        return auth_err
     try:
         data = request.get_json(silent=True) or {}
         mappings = data.get("mappings") or []
@@ -4637,6 +4769,9 @@ def api_admin_gudang_locations_post():
 
 @app.route('/api/admin/petugas-assignments', methods=['GET'])
 def api_admin_petugas_assignments_get():
+    auth_err = require_admin_auth()
+    if auth_err:
+        return auth_err
     try:
         force_refresh = request.args.get("refresh") in ("1", "true", "yes")
         payload, from_cache = build_petugas_assignments_admin_payload(force_refresh=force_refresh)
@@ -4658,6 +4793,9 @@ def api_admin_petugas_assignments_get():
 
 @app.route('/api/admin/petugas-assignments', methods=['POST'])
 def api_admin_petugas_assignments_post():
+    auth_err = require_admin_auth()
+    if auth_err:
+        return auth_err
     try:
         data = request.get_json(silent=True) or {}
         assignments = data.get("assignments")
@@ -4723,8 +4861,8 @@ def history():
         if from_cache and not force_refresh:
             response.headers["Cache-Control"] = f"private, max-age={_HISTORY_CACHE_TTL}"
         return response, 200
-    except Exception:
-        return jsonify({"items": [], "truncated": False}), 500
+    except Exception as e:
+        return jsonify({"items": [], "truncated": False, "error": str(e)}), 500
 
 @app.route('/submit', methods=['POST'])
 def submit():
@@ -4778,6 +4916,7 @@ def submit():
             lookups.get("assignments") or {},
             lookups.get("enforced_session_ids") or [],
             counter_lookup,
+            lookups.get("global_assignments") or {},
         )
         if not ok:
             return jsonify({
@@ -4844,6 +4983,8 @@ def submit():
         sheet.append_row(row_to_append)
         invalidate_history_cache(counter_name, session_id)
         invalidate_summary_cache(session_id)
+        invalidate_dashboard_cache(session_id)
+        invalidate_log_id_row_cache()
         update_dup_index_entry(session_id, counter_name, loc_string, sku_code, physical_count)
         maybe_refresh_session_stock(session_id)
         return jsonify({"status": "success"}), 200
@@ -4864,11 +5005,10 @@ def edit():
 
         wb = get_spreadsheet_cached()
         sheet = wb.worksheet("Raw Counts")
-        cell = sheet.find(log_id)
-        if not cell:
+        row_num = find_row_by_log_id(sheet, log_id)
+        if not row_num:
             return jsonify({"status": "error", "message": "Record row not found"}), 404
 
-        row_num = cell.row
         row_values = sheet.get(f"A{row_num}:K{row_num}")
         if not row_values:
             return jsonify({"status": "error", "message": "Record row not found"}), 404
@@ -4909,6 +5049,7 @@ def edit():
             lookups.get("assignments") or {},
             lookups.get("enforced_session_ids") or [],
             counter_lookup,
+            lookups.get("global_assignments") or {},
         )
         if not ok:
             return jsonify({
@@ -4941,7 +5082,7 @@ def edit():
             return jsonify({"status": "error", "message": "Jumlah tidak boleh negatif."}), 400
 
         dup_count = find_duplicate_excluding(
-            sheet, row_session, counter_name, loc_string, sku_code, log_id
+            sheet, row_session, counter_name, loc_string, sku_code, log_id, counter_lookup
         )
         if dup_count is not None:
             return jsonify({
@@ -4974,20 +5115,36 @@ def edit():
 @app.route('/delete', methods=['POST'])
 def delete():
     try:
-        data = request.json
-        log_id = data['id']
+        data = request.json or {}
+        log_id = str(data.get("id", "")).strip()
+        if not log_id:
+            return jsonify({"status": "error", "message": "ID catatan tidak valid."}), 400
+
         session_id = str(data.get("session_id", "")).strip()
-        
+        if not session_id:
+            return jsonify({"status": "error", "message": "Sesi tidak dipilih."}), 400
+        if not require_valid_session_id(session_id):
+            return jsonify({"status": "error", "message": "Sesi tidak valid."}), 400
+
         wb = get_spreadsheet_cached()
         sheet = wb.worksheet("Raw Counts")
-        cell = sheet.find(log_id)
-        
-        if cell:
-            sheet.delete_rows(cell.row)
-            invalidate_count_caches(session_id=session_id or None, invalidate_dup=True)
-            maybe_refresh_session_stock(session_id)
-            return jsonify({"status": "success"}), 200
-        return jsonify({"status": "error", "message": "Record row not found"}), 404
+        row_num = find_row_by_log_id(sheet, log_id)
+        if not row_num:
+            return jsonify({"status": "error", "message": "Record row not found"}), 404
+
+        row_values = sheet.get(f"A{row_num}:K{row_num}")
+        if not row_values:
+            return jsonify({"status": "error", "message": "Record row not found"}), 404
+        existing = _row_dict_from_padded(list(row_values[0]) + [""] * 11)
+        row_session = str(existing.get("Session ID", "")).strip()
+        if row_session != session_id:
+            return jsonify({"status": "error", "message": "Catatan tidak termasuk sesi aktif."}), 403
+
+        counter_name = get_row_counter_name(existing)
+        sheet.delete_rows(row_num)
+        invalidate_count_caches(counter_name=counter_name or None, session_id=session_id, invalidate_dup=True)
+        maybe_refresh_session_stock(session_id)
+        return jsonify({"status": "success"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -4995,5 +5152,3 @@ def delete():
 @app.route('/favicon.png')
 def favicon():
     return '', 204
-
-app = app

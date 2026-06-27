@@ -1,5 +1,5 @@
-flask
-gspread
-google-auth
-pytz
-openpyxl
+flask>=3.0,<4
+gspread>=6.0,<7
+google-auth>=2.0,<3
+pytz>=2024.1
+openpyxl>=3.1,<4
