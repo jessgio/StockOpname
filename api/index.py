@@ -1809,9 +1809,10 @@ HTML_TEMPLATE = """
     <style>
         #scanModal { display: none !important; visibility: hidden !important; pointer-events: none !important; }
         #scanModal.is-open { display: block !important; visibility: visible !important; pointer-events: auto !important; }
-        #editModal { display: none !important; visibility: hidden !important; pointer-events: none !important; }
+        #editModal { display: none !important; visibility: hidden !important; pointer-events: none !important; z-index: 70 !important; }
         #editModal.is-open { display: block !important; visibility: visible !important; pointer-events: auto !important; }
-        #toast { pointer-events: none !important; }
+        #toast { pointer-events: none !important; z-index: 80 !important; }
+        #historyContainer button { touch-action: manipulation; pointer-events: auto !important; }
         #step1Card { position: relative; z-index: 1; pointer-events: auto !important; }
         #step1Card input, #step1Card button { pointer-events: auto !important; touch-action: manipulation; }
         .opname-field {
@@ -1912,11 +1913,17 @@ HTML_TEMPLATE = """
             function unblockPage() {
                 document.body.style.overflow = '';
                 document.body.style.pointerEvents = '';
-                var modal = document.getElementById('scanModal');
-                if (modal) {
-                    modal.hidden = true;
-                    modal.classList.remove('is-open');
-                    modal.style.display = 'none';
+                var scanModal = document.getElementById('scanModal');
+                if (scanModal) {
+                    scanModal.hidden = true;
+                    scanModal.classList.remove('is-open');
+                    scanModal.style.display = 'none';
+                }
+                var editModal = document.getElementById('editModal');
+                if (editModal) {
+                    editModal.hidden = true;
+                    editModal.classList.remove('is-open');
+                    editModal.style.display = 'none';
                 }
             }
             if (document.readyState === 'loading') {
@@ -2132,7 +2139,7 @@ HTML_TEMPLATE = """
     </div>
 
     <!-- Edit history record modal -->
-    <div id="editModal" hidden class="fixed inset-0 z-40" role="dialog" aria-modal="true" aria-labelledby="editModalTitle">
+    <div id="editModal" hidden class="fixed inset-0 z-[70]" role="dialog" aria-modal="true" aria-labelledby="editModalTitle">
         <div class="absolute inset-0 bg-black/50" onclick="closeEditModal()"></div>
         <div class="absolute inset-x-0 bottom-0 max-h-[92vh] flex flex-col bg-white rounded-t-2xl shadow-2xl lg:inset-auto lg:top-1/2 lg:left-1/2 lg:-translate-x-1/2 lg:-translate-y-1/2 lg:w-full lg:max-w-md lg:rounded-2xl">
             <div class="flex items-center justify-between px-4 py-3 border-b border-zinc-100 shrink-0">
@@ -2251,6 +2258,7 @@ HTML_TEMPLATE = """
         let lastHandledScan = { key: '', at: 0, target: '' };
         let lastAssignmentFetchKey = '';
         let html5QrcodeScanner = null;
+        let historyItemsCache = [];
         const COUNTER_PREFIXES = [
             'counter:', 'counter name:', 'name:', 'nama:', 'nama petugas:',
             'petugas:', 'id:', 'badge:', 'id badge:',
@@ -2820,6 +2828,7 @@ HTML_TEMPLATE = """
             }
             resetPageInteractionState();
             bindScanButtons();
+            bindHistoryActions();
             await loadLookups();
             const skuInput = document.getElementById('skuInput');
             if (skuInput) {
@@ -3264,6 +3273,34 @@ HTML_TEMPLATE = """
             }
         }
 
+        function bindHistoryActions() {
+            const container = document.getElementById('historyContainer');
+            if (!container || container.dataset.historyBound === '1') return;
+            container.dataset.historyBound = '1';
+            container.addEventListener('click', (e) => {
+                const editBtn = e.target.closest('[data-history-edit]');
+                if (editBtn) {
+                    e.preventDefault();
+                    const idx = Number(editBtn.getAttribute('data-history-edit'));
+                    const item = historyItemsCache[idx];
+                    if (!item || !item.id) {
+                        showToast('Catatan tidak valid. Muat ulang riwayat.', 'error');
+                        return;
+                    }
+                    editItem(item.id, item.location, item.sku, item.count);
+                    return;
+                }
+                const delBtn = e.target.closest('[data-history-delete]');
+                if (delBtn) {
+                    e.preventDefault();
+                    const idx = Number(delBtn.getAttribute('data-history-delete'));
+                    const item = historyItemsCache[idx];
+                    if (!item || !item.id) return;
+                    deleteItem(item.id);
+                }
+            });
+        }
+
         window.openScanModal = openScanModal;
         window.closeScanModal = closeScanModal;
         window.onCounterNameInput = onCounterNameInput;
@@ -3272,10 +3309,7 @@ HTML_TEMPLATE = """
         window.fetchHistory = fetchHistory;
         window.fetchAssignedLocations = fetchAssignedLocations;
         window.adjustCount = adjustCount;
-        window.editItem = editItem;
-        window.closeEditModal = closeEditModal;
-        window.saveEdit = saveEdit;
-        window.adjustEditCount = adjustEditCount;
+        window.refreshLookupsFromSheet = refreshLookupsFromSheet;
 
         function adjustCount(amount) {
             const countInput = document.getElementById('count');
@@ -3372,7 +3406,8 @@ HTML_TEMPLATE = """
                     return;
                 }
 
-                const rowsHtml = data.map(item => `
+                historyItemsCache = data;
+                const rowsHtml = data.map((item, idx) => `
                     <div class="border border-zinc-100 rounded-lg p-3 hover:bg-zinc-50/80 transition">
                         <div class="flex justify-between items-start gap-2">
                             <div class="min-w-0 flex-1">
@@ -3386,8 +3421,8 @@ HTML_TEMPLATE = """
                             </div>
                         </div>
                         <div class="flex gap-2 mt-2 pt-2 border-t border-zinc-100">
-                            <button type="button" onclick="editItem(${JSON.stringify(item.id)}, ${JSON.stringify(item.location)}, ${JSON.stringify(item.sku)}, ${Number(item.count) || 0})" class="text-xs font-medium text-amber-700 hover:text-amber-900">Edit</button>
-                            <button type="button" onclick="deleteItem(${JSON.stringify(item.id)})" class="text-xs font-medium text-rose-600 hover:text-rose-800">Delete</button>
+                            <button type="button" data-history-edit="${idx}" class="text-xs font-medium text-amber-700 hover:text-amber-900 px-2 py-1 -mx-2">Edit</button>
+                            <button type="button" data-history-delete="${idx}" class="text-xs font-medium text-rose-600 hover:text-rose-800 px-2 py-1 -mx-2">Delete</button>
                         </div>
                     </div>
                 `).join('');
@@ -3474,7 +3509,12 @@ HTML_TEMPLATE = """
         }
 
         async function editItem(logId, location, sku, count) {
-            document.getElementById('editLogId').value = logId;
+            const logIdStr = String(logId || '').trim();
+            if (!logIdStr) {
+                showToast('ID catatan tidak valid.', 'error');
+                return;
+            }
+            document.getElementById('editLogId').value = logIdStr;
             document.getElementById('editLocation').value = location || '';
             document.getElementById('editSku').value = sku || '';
             document.getElementById('editCount').value = Number(count) || 0;
@@ -3608,6 +3648,12 @@ HTML_TEMPLATE = """
                 alert('Kesalahan jaringan, penghapusan dibatalkan.');
             }
         }
+
+        window.editItem = editItem;
+        window.closeEditModal = closeEditModal;
+        window.saveEdit = saveEdit;
+        window.adjustEditCount = adjustEditCount;
+        window.deleteItem = deleteItem;
     </script>
 </body>
 </html>
