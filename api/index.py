@@ -4437,7 +4437,13 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             <div id="adminTokenStatus" class="hidden rounded-lg border px-3 py-2 text-sm"></div>
         </section>
         <section class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
-            <h2 class="text-base font-bold text-zinc-900">Upload stok sistem (Excel)</h2>
+            <div class="flex flex-wrap items-center justify-between gap-3">
+                <h2 class="text-base font-bold text-zinc-900">Upload stok sistem (Excel)</h2>
+                <button type="button" id="refreshLookupsBtn" onclick="refreshAdminLookups()"
+                    class="text-xs font-semibold text-violet-700 hover:text-violet-900 disabled:opacity-50">
+                    Refresh daftar
+                </button>
+            </div>
             <p class="text-sm text-zinc-600">
                 Dua format dideteksi otomatis dari file Excel (<strong>.xlsx</strong> atau <strong>.xls</strong>):
             </p>
@@ -4456,9 +4462,11 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             </ul>
             <p class="text-sm text-zinc-600">
                 Hanya SKU yang ada di tab <strong>SKU List</strong> yang dimasukkan; baris seperti <strong>Total Kode Barang</strong> diabaikan.
+                Setelah menambah SKU atau mapping gudang di Google Sheet, klik <strong>Refresh daftar</strong> lalu upload ulang file.
                 Tab baru di Google Sheet dibuat dengan nama <strong>Session ID</strong>.
                 Hitungan fisik (Raw Counts) untuk pasangan gudang/SKU yang tidak ada di file ditambahkan dengan <strong>System Qty 0</strong>.
             </p>
+            <p id="lookupRefreshStatus" class="hidden text-sm"></p>
             <div class="grid gap-4 sm:grid-cols-2">
                 <div>
                     <label for="sessionSelect" class="block text-sm font-semibold text-zinc-700 mb-2">Session</label>
@@ -4709,6 +4717,41 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                 flagBox.classList.remove('hidden');
                 document.getElementById('unmappedFlagTitle').textContent = 'Gagal memeriksa mapping lokasi.';
                 document.getElementById('unmappedFlagList').innerHTML = '';
+            }
+        }
+
+        async function refreshAdminLookups() {
+            const btn = document.getElementById('refreshLookupsBtn');
+            if (btn) btn.disabled = true;
+            setStatus('lookupRefreshStatus', 'Memuat ulang SKU List & GUDANG LOCATIONS dari sheet…', 'info');
+            try {
+                const [skuRes, gudangRes] = await Promise.all([
+                    fetch('/api/sku-codes?refresh=1'),
+                    fetch('/api/admin/gudang-locations?refresh=1', { headers: adminAuthHeaders() }),
+                ]);
+                const skuData = await skuRes.json().catch(() => ({}));
+                const gudangData = await gudangRes.json().catch(() => ({}));
+                if (!skuRes.ok) {
+                    throw new Error(skuData.error || 'Gagal memuat SKU List dari sheet.');
+                }
+                if (gudangRes.status === 401) {
+                    throw new Error('Token admin ditolak — periksa token di bagian atas halaman.');
+                }
+                if (!gudangRes.ok) {
+                    throw new Error(gudangData.message || gudangData.error || 'Gagal memuat GUDANG LOCATIONS.');
+                }
+                const skuCount = (skuData.sku_codes || []).length;
+                const mapCount = gudangData.mapping_count || (gudangData.mappings || []).length;
+                let msg = 'Daftar dimuat ulang: ' + skuCount + ' SKU, ' + mapCount + ' baris mapping gudang.';
+                if ((skuData.warnings || []).length) {
+                    msg += ' (' + skuData.warnings.length + ' peringatan SKU)';
+                }
+                setStatus('lookupRefreshStatus', msg, 'success');
+                showUnmappedLocations(gudangData.unmapped_locations || [], 'setup');
+            } catch (e) {
+                setStatus('lookupRefreshStatus', e.message || 'Gagal memuat ulang daftar.', 'error');
+            } finally {
+                if (btn) btn.disabled = false;
             }
         }
 
