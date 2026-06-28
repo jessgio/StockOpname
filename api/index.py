@@ -1526,6 +1526,26 @@ def load_gudang_location_mappings(wb):
             mappings.append({"location": location, "gudang": gudang, "notes": notes})
     return mappings
 
+def _gudang_location_match_keys(location):
+    """Candidate lookup keys for a location string (physical, zone, or NetSuite virtual)."""
+    loc = str(location or "").strip()
+    if not loc:
+        return []
+    keys = []
+    def add(key):
+        if key and key not in keys:
+            keys.append(key)
+    add(loc.lower())
+    add(normalize_scan_text(loc, "location").lower())
+    if ":" in loc:
+        suffix = loc.split(":", 1)[1].strip()
+        if suffix:
+            add(suffix.lower())
+            add(normalize_scan_text(suffix, "location").lower())
+    if "-" in loc:
+        add(loc.split("-")[0].strip().lower())
+    return keys
+
 def build_gudang_location_index(wb, force_refresh=False):
     now = time.time()
     if not force_refresh:
@@ -1538,11 +1558,14 @@ def build_gudang_location_index(wb, force_refresh=False):
     for item in mappings:
         loc = item["location"]
         gudang = item["gudang"]
-        index[loc.lower()] = gudang
-        index[normalize_scan_text(loc, "location").lower()] = gudang
-        zone = loc.split("-")[0].strip().lower() if "-" in loc else ""
-        if zone and zone not in index:
-            index[zone] = gudang
+        for key in _gudang_location_match_keys(loc):
+            if key not in index:
+                index[key] = gudang
+        # Gudang column often holds NetSuite virtual warehouse strings that also appear
+        # as Location in inventory snapshot exports — index them so both sides reconcile.
+        for key in _gudang_location_match_keys(gudang):
+            if key not in index:
+                index[key] = gudang
     with _CACHE_LOCK:
         _GUDANG_INDEX_CACHE["index"] = index
         _GUDANG_INDEX_CACHE["expires"] = now + _LOOKUPS_CACHE_TTL
@@ -1551,16 +1574,11 @@ def build_gudang_location_index(wb, force_refresh=False):
 def resolve_gudang_for_location(location, gudang_index):
     if not location or not gudang_index:
         return None
-    loc = str(location).strip()
-    if not loc:
-        return None
-    if loc.lower() in gudang_index:
-        return gudang_index[loc.lower()]
-    norm = normalize_scan_text(loc, "location").lower()
-    if norm in gudang_index:
-        return gudang_index[norm]
-    zone = loc.split("-")[0].strip().lower() if "-" in loc else loc.lower()
-    return gudang_index.get(zone)
+    for key in _gudang_location_match_keys(location):
+        gudang = gudang_index.get(key)
+        if gudang:
+            return gudang
+    return None
 
 def aggregate_counts_by_gudang_sku(records, gudang_index):
     """Sum physical counts per (gudang, sku) using the location→gudang index."""
@@ -1686,9 +1704,29 @@ def _parse_inventory_snapshot_ws(ws, layout, sku_lookup, gudang_index):
         for (gudang, sku), qty in sorted(totals.items())
     ]
     if not rows_out:
+        detail_parts = []
+        data_rows = max(0, (max_row or 0) - header_row)
+        if excluded_unrecognized:
+            detail_parts.append(
+                f"{excluded_unrecognized} baris dilewati karena SKU tidak ada di tab SKU List"
+            )
+        if unmapped_locations:
+            samples = "; ".join(sorted(unmapped_locations)[:5])
+            detail_parts.append(
+                f"{len(unmapped_locations)} lokasi virtual tidak terpetakan ke gudang "
+                f"(contoh: {samples})"
+            )
+        if not detail_parts and data_rows:
+            detail_parts.append(
+                f"{data_rows} baris data terbaca tetapi tidak ada kuantitas non-nol yang valid"
+            )
+        detail = ". ".join(detail_parts) if detail_parts else (
+            "Periksa kolom Item, Location, On Hand."
+        )
         raise ValueError(
-            "Tidak ada baris stok sistem yang terbaca dari snapshot. "
-            "Periksa kolom Item, Location, On Hand dan mapping tab GUDANG LOCATIONS."
+            "Tidak ada baris stok sistem yang terbaca dari snapshot. " + detail
+            + " Tambahkan mapping lokasi virtual NetSuite (atau suffix setelah ':') "
+            "ke tab GUDANG LOCATIONS."
         )
     if unmapped_locations and len(warnings) < 50:
         warnings.append(
@@ -4503,9 +4541,10 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                 <button type="button" onclick="loadUnmappedLocations()" class="text-xs font-semibold text-violet-700 hover:text-violet-900">Periksa ulang</button>
             </div>
             <p class="text-sm text-zinc-600">
-                Mapping lokasi/zone → gudang diatur di tab <strong>GUDANG LOCATIONS</strong> pada Google Sheet (bukan di halaman ini).
-                Gunakan nilai <strong>Location</strong> persis seperti di file snapshot NetSuite (mis. <code class="text-xs bg-zinc-100 px-1 rounded">W.H (D.I Panjaitan):WH FG (Online Order)</code>)
-                atau lokasi fisik dari tab LOCATIONS.
+                Mapping lokasi fisik/zone → gudang diatur di tab <strong>GUDANG LOCATIONS</strong> pada Google Sheet (bukan di halaman ini).
+                Kolom <strong>Location</strong> = lokasi hitung fisik (mis. <code class="text-xs bg-zinc-100 px-1 rounded">ONLINE-A1-1</code>);
+                kolom <strong>Gudang</strong> = label gudang / lokasi virtual NetSuite
+                (mis. <code class="text-xs bg-zinc-100 px-1 rounded">W.H (D.I Panjaitan):WH FG (Online Order)</code>).
             </p>
             <div id="unmappedOkBox" class="hidden rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
                 Semua lokasi di tab LOCATIONS sudah terpetakan ke gudang.
