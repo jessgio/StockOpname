@@ -1266,7 +1266,39 @@ STOCK_RECON_HEADERS = ("Gudang", "SKU", "System Qty", "Running Count", "Gap", "V
 _EXCEL_GUDANG_ROW = 5
 _EXCEL_SKU_COL = 3
 _EXCEL_DATA_START_ROW = 6
-_EXCEL_SKU_HEADER_NAMES = ("kode barang", "sku code", "sku", "kode")
+_EXCEL_SKU_HEADER_NAMES = ("kode barang", "sku code", "sku", "kode", "item")
+_INVENTORY_ITEM_HEADERS = frozenset({"item", "sku", "sku code", "kode barang", "kode"})
+_INVENTORY_LOCATION_HEADERS = frozenset({
+    "location", "lokasi", "precise location", "virtual location", "kode lokasi",
+})
+_INVENTORY_ON_HAND_HEADERS = frozenset({
+    "on hand", "onhand", "on-hand", "qty on hand", "quantity on hand", "on hand qty",
+})
+
+def _excel_cell_label(value):
+    return " ".join(str(value or "").strip().lower().split())
+
+def find_inventory_snapshot_header_row(ws):
+    """Find header row with Item + Location + On Hand (e.g. row 6 in NetSuite snapshot)."""
+    max_scan_row = min(25, ws.max_row or 1)
+    max_col = max(ws.max_column or 0, 8)
+    for header_row in range(1, max_scan_row + 1):
+        item_col = None
+        loc_col = None
+        qty_col = None
+        for col in range(1, max_col + 1):
+            low = _excel_cell_label(ws.cell(row=header_row, column=col).value)
+            if not low:
+                continue
+            if item_col is None and low in _INVENTORY_ITEM_HEADERS:
+                item_col = col
+            if loc_col is None and low in _INVENTORY_LOCATION_HEADERS:
+                loc_col = col
+            if qty_col is None and low in _INVENTORY_ON_HAND_HEADERS:
+                qty_col = col
+        if item_col and loc_col and qty_col:
+            return header_row, item_col, loc_col, qty_col
+    return None
 
 def _is_excel_sku_header(label):
     low = " ".join(str(label or "").strip().lower().split())
@@ -1276,7 +1308,7 @@ def _is_excel_sku_header(label):
         return True
     return "kode" in low and "barang" in low
 
-def detect_excel_stock_layout(ws):
+def detect_erp_gudang_layout(ws):
     """Find SKU column and gudang columns from the header row (default row 5)."""
     header_row = _EXCEL_GUDANG_ROW
     sku_col = None
@@ -1296,6 +1328,14 @@ def detect_excel_stock_layout(ws):
     if sku_col is None:
         sku_col = _EXCEL_SKU_COL
     return header_row, sku_col, gudang_cols
+
+def detect_excel_stock_layout(ws):
+    """Detect inventory snapshot (Item/Location/On Hand) or legacy ERP gudang-column layout."""
+    snapshot = find_inventory_snapshot_header_row(ws)
+    if snapshot:
+        return ("snapshot", snapshot)
+    header_row, sku_col, gudang_cols = detect_erp_gudang_layout(ws)
+    return ("erp", (header_row, sku_col, gudang_cols))
 
 def sanitize_worksheet_title(name):
     s = str(name or "").strip()
@@ -1430,21 +1470,13 @@ def _is_excel_summary_sku_row(sku):
         return True
     return False
 
-def parse_system_stock_excel(file_bytes, sku_lookup=None):
-    """Parse ERP export: header row 5 with Kode Barang + Gudang columns; data from row 6."""
-    # read_only breaks max_row on some ERP exports; load fully for reliable dimensions.
-    wb_xl = load_workbook(BytesIO(file_bytes), data_only=True)
-    ws = wb_xl.active
-    header_row, sku_col, gudang_cols = detect_excel_stock_layout(ws)
+def _parse_erp_gudang_stock_ws(ws, layout, sku_lookup):
+    header_row, sku_col, gudang_cols = layout
     if not gudang_cols:
-        wb_xl.close()
         raise ValueError(
             "Tidak menemukan nama gudang di baris 5. "
             'Pastikan ada sel seperti "Gudang Finished Goods", "Gudang Raw", dll.'
         )
-    if not sku_lookup:
-        wb_xl.close()
-        raise ValueError("Daftar SKU tidak tersedia. Periksa tab SKU List di sheet sebelum upload.")
     rows_out = []
     warnings = []
     excluded_unrecognized = 0
@@ -1460,7 +1492,8 @@ def parse_system_stock_excel(file_bytes, sku_lookup=None):
         resolved = resolve_sku(sku, sku_lookup)
         if not resolved:
             excluded_unrecognized += 1
-            warnings.append(f"SKU tidak dikenali (baris {row_idx}): {sku}")
+            if len(warnings) < 50:
+                warnings.append(f"SKU tidak dikenali (baris {row_idx}): {sku}")
             continue
         sku = resolved
         for col_idx, gudang in gudang_cols.items():
@@ -1468,13 +1501,93 @@ def parse_system_stock_excel(file_bytes, sku_lookup=None):
             if qty == 0:
                 continue
             rows_out.append({"gudang": gudang, "sku": sku, "system_qty": qty})
-    wb_xl.close()
     if not rows_out:
         raise ValueError(
             "Tidak ada baris stok sistem yang terbaca. "
             "Pastikan SKU ada di tab SKU List dan kuantitas gudang tidak nol."
         )
-    return rows_out, warnings, excluded_unrecognized
+    return rows_out, warnings, excluded_unrecognized, set()
+
+def _parse_inventory_snapshot_ws(ws, layout, sku_lookup, gudang_index):
+    """Parse Item / Location / On Hand rows; map Location via GUDANG LOCATIONS → gudang."""
+    header_row, item_col, loc_col, qty_col = layout
+    totals = {}
+    warnings = []
+    excluded_unrecognized = 0
+    unmapped_locations = set()
+    seen_unmapped_warn = set()
+    data_start = header_row + 1
+    max_row = ws.max_row or data_start
+    for row_idx in range(data_start, max_row + 1):
+        raw_sku = ws.cell(row=row_idx, column=item_col).value
+        raw_loc = ws.cell(row=row_idx, column=loc_col).value
+        if raw_sku is None or str(raw_sku).strip() == "":
+            continue
+        sku = str(raw_sku).strip()
+        if _is_excel_summary_sku_row(sku):
+            continue
+        loc = str(raw_loc or "").strip()
+        if not loc:
+            continue
+        resolved = resolve_sku(sku, sku_lookup)
+        if not resolved:
+            excluded_unrecognized += 1
+            if len(warnings) < 50:
+                warnings.append(f"SKU tidak dikenali (baris {row_idx}): {sku}")
+            continue
+        gudang = resolve_gudang_for_location(loc, gudang_index)
+        if not gudang:
+            unmapped_locations.add(loc)
+            if loc not in seen_unmapped_warn and len(warnings) < 50:
+                seen_unmapped_warn.add(loc)
+                warnings.append(
+                    f"Lokasi tidak terpetakan ke gudang (baris {row_idx}): {loc}"
+                )
+            continue
+        qty = parse_excel_quantity(ws.cell(row=row_idx, column=qty_col).value)
+        if qty == 0:
+            continue
+        key = session_stock_key(gudang, resolved)
+        if not key[0] or not key[1]:
+            continue
+        totals[key] = totals.get(key, 0) + qty
+    rows_out = [
+        {"gudang": gudang, "sku": sku, "system_qty": qty}
+        for (gudang, sku), qty in sorted(totals.items())
+    ]
+    if not rows_out:
+        raise ValueError(
+            "Tidak ada baris stok sistem yang terbaca dari snapshot. "
+            "Periksa kolom Item, Location, On Hand dan mapping tab GUDANG LOCATIONS."
+        )
+    if unmapped_locations and len(warnings) < 50:
+        warnings.append(
+            f"{len(unmapped_locations)} lokasi di file tidak terpetakan — tambahkan ke tab GUDANG LOCATIONS."
+        )
+    return rows_out, warnings, excluded_unrecognized, unmapped_locations
+
+def parse_system_stock_excel(file_bytes, sku_lookup=None, gudang_index=None):
+    """Parse ERP gudang-column export or inventory snapshot (Item/Location/On Hand)."""
+    wb_xl = load_workbook(BytesIO(file_bytes), data_only=True)
+    ws = wb_xl.active
+    if not sku_lookup:
+        wb_xl.close()
+        raise ValueError("Daftar SKU tidak tersedia. Periksa tab SKU List di sheet sebelum upload.")
+    layout_kind, layout = detect_excel_stock_layout(ws)
+    try:
+        if layout_kind == "snapshot":
+            if not gudang_index:
+                raise ValueError(
+                    "Mapping gudang tidak tersedia. Periksa tab GUDANG LOCATIONS sebelum upload snapshot."
+                )
+            rows, warnings, excluded, unmapped_file = _parse_inventory_snapshot_ws(
+                ws, layout, sku_lookup, gudang_index
+            )
+            return rows, warnings, excluded, unmapped_file, "snapshot"
+        rows, warnings, excluded, unmapped_file = _parse_erp_gudang_stock_ws(ws, layout, sku_lookup)
+        return rows, warnings, excluded, unmapped_file, "erp"
+    finally:
+        wb_xl.close()
 
 def stock_variance_pct(system_qty, running_qty):
     gap = running_qty - system_qty
@@ -1604,23 +1717,25 @@ def import_system_stock_for_session(session_id, file_bytes):
         raise ValueError("Sesi tidak valid.")
     wb = get_spreadsheet_cached()
     sku_lookup = load_sku_lookup_cached(wb)
-    stock_rows, warnings, excluded_unrecognized = parse_system_stock_excel(
-        file_bytes, sku_lookup=sku_lookup
-    )
     gudang_index, _ = build_gudang_location_index(wb)
+    stock_rows, warnings, excluded_unrecognized, unmapped_file, upload_format = parse_system_stock_excel(
+        file_bytes, sku_lookup=sku_lookup, gudang_index=gudang_index
+    )
     sheet = wb.worksheet("Raw Counts")
     records = read_raw_counts_for_summary(sheet, session_id=session_id)
-    running_by_key, unmapped = aggregate_counts_by_gudang_sku(records, gudang_index)
+    running_by_key, unmapped_physical = aggregate_counts_by_gudang_sku(records, gudang_index)
     ws = get_session_stock_worksheet(wb, session_id, create=True)
     row_count, physical_only = write_session_stock_tab(ws, stock_rows, running_by_key)
     _STOCK_REFRESH_LAST[session_id] = time.time()
+    all_unmapped = sorted(set(unmapped_physical) | set(unmapped_file))
     return {
         "row_count": row_count,
         "physical_only_rows": physical_only,
         "tab_title": sanitize_worksheet_title(session_id),
         "warnings": warnings,
         "excluded_unrecognized": excluded_unrecognized,
-        "unmapped_locations": sorted(unmapped),
+        "unmapped_locations": all_unmapped,
+        "upload_format": upload_format,
     }
 
 def save_gudang_location_mappings(mappings):
@@ -4158,12 +4273,24 @@ ADMIN_STOCK_HTML_TEMPLATE = """
         <section class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
             <h2 class="text-base font-bold text-zinc-900">Upload stok sistem (Excel)</h2>
             <p class="text-sm text-zinc-600">
-                File ERP: baris <strong>5</strong> berisi <strong>Kode Barang</strong> dan nama gudang; data mulai baris 6
-                (kolom SKU terdeteksi otomatis, biasanya kolom A atau C).
+                Dua format dideteksi otomatis dari file Excel:
+            </p>
+            <ul class="text-sm text-zinc-600 list-disc pl-5 space-y-1">
+                <li>
+                    <strong>Inventory snapshot</strong> (NetSuite): header di baris 6 (atau baris lain dalam 25 baris pertama)
+                    dengan kolom <strong>Item</strong> (SKU), <strong>Location</strong> (lokasi virtual sistem),
+                    dan <strong>On Hand</strong> (kuantitas sistem). Lokasi di file dipetakan ke gudang via tab
+                    <strong>GUDANG LOCATIONS</strong>; baris dengan SKU/lokasi sama dijumlahkan per gudang.
+                </li>
+                <li>
+                    <strong>ERP gudang kolom</strong>: baris <strong>5</strong> berisi <strong>Kode Barang</strong> dan nama gudang;
+                    data mulai baris 6 (kolom SKU terdeteksi otomatis, biasanya kolom A atau C).
+                </li>
+            </ul>
+            <p class="text-sm text-zinc-600">
                 Hanya SKU yang ada di tab <strong>SKU List</strong> yang dimasukkan; baris seperti <strong>Total Kode Barang</strong> diabaikan.
-                Tab baru di Google Sheet akan dibuat dengan nama <strong>Session ID</strong>.
-                Hitungan fisik (Raw Counts) untuk pasangan gudang/SKU yang tidak ada di file ERP ditambahkan dengan <strong>System Qty 0</strong>
-                (gudang dari tab <strong>GUDANG LOCATIONS</strong>).
+                Tab baru di Google Sheet dibuat dengan nama <strong>Session ID</strong>.
+                Hitungan fisik (Raw Counts) untuk pasangan gudang/SKU yang tidak ada di file ditambahkan dengan <strong>System Qty 0</strong>.
             </p>
             <div class="grid gap-4 sm:grid-cols-2">
                 <div>
@@ -4248,6 +4375,8 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             </div>
             <p class="text-sm text-zinc-600">
                 Mapping lokasi/zone → gudang diatur di tab <strong>GUDANG LOCATIONS</strong> pada Google Sheet (bukan di halaman ini).
+                Gunakan nilai <strong>Location</strong> persis seperti di file snapshot NetSuite (mis. <code class="text-xs bg-zinc-100 px-1 rounded">W.H (D.I Panjaitan):WH FG (Online Order)</code>)
+                atau lokasi fisik dari tab LOCATIONS.
             </p>
             <div id="unmappedOkBox" class="hidden rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
                 Semua lokasi di tab LOCATIONS sudah terpetakan ke gudang.
@@ -4445,6 +4574,11 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                 const data = await res.json();
                 if (!res.ok) throw new Error(data.message || 'Upload gagal');
                 let msg = 'Tab "' + (data.tab_title || sessionId) + '" dibuat/diperbarui dengan ' + data.row_count + ' baris.';
+                if (data.upload_format === 'snapshot') {
+                    msg += ' Format: inventory snapshot (Item / Location / On Hand).';
+                } else if (data.upload_format === 'erp') {
+                    msg += ' Format: ERP gudang kolom.';
+                }
                 if (data.physical_only_rows) {
                     msg += ' (' + data.physical_only_rows + ' hanya hitungan fisik, System Qty 0).';
                 }
