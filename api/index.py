@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta
 import pytz
 from openpyxl import load_workbook
+import xlrd
 
 app = Flask(__name__)
 
@@ -1274,6 +1275,51 @@ _INVENTORY_LOCATION_HEADERS = frozenset({
 _INVENTORY_ON_HAND_HEADERS = frozenset({
     "on hand", "onhand", "on-hand", "qty on hand", "quantity on hand", "on hand qty",
 })
+STOCK_UPLOAD_EXTENSIONS = (".xlsx", ".xlsm", ".xls")
+_XLS_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+class _ExcelCell:
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+class _XlrdWorksheetAdapter:
+    """openpyxl-like view of an xlrd sheet (1-based row/column indexing)."""
+
+    def __init__(self, sheet):
+        self._sheet = sheet
+        self.max_row = sheet.nrows
+        self.max_column = sheet.ncols
+
+    def cell(self, row, column):
+        r, c = row - 1, column - 1
+        if r < 0 or c < 0 or r >= self._sheet.nrows or c >= self._sheet.ncols:
+            return _ExcelCell(None)
+        return _ExcelCell(self._sheet.cell_value(r, c))
+
+def is_stock_upload_filename(filename):
+    return bool(filename) and str(filename).lower().endswith(STOCK_UPLOAD_EXTENSIONS)
+
+def is_xls_workbook_bytes(file_bytes):
+    return len(file_bytes) >= 8 and file_bytes[:8] == _XLS_OLE_MAGIC
+
+def open_stock_excel_worksheet(file_bytes, filename=None):
+    """Open first worksheet from .xls (xlrd) or .xlsx/.xlsm (openpyxl). Returns (ws, close_fn)."""
+    use_xls = is_xls_workbook_bytes(file_bytes)
+    if not use_xls and filename and str(filename).lower().endswith(".xls"):
+        use_xls = True
+    if use_xls:
+        try:
+            book = xlrd.open_workbook(file_contents=file_bytes)
+        except Exception as e:
+            raise ValueError(f"Tidak dapat membaca file .xls: {e}")
+        return _XlrdWorksheetAdapter(book.sheet_by_index(0)), lambda: None
+    try:
+        wb_xl = load_workbook(BytesIO(file_bytes), data_only=True)
+    except Exception as e:
+        raise ValueError(f"Tidak dapat membaca file Excel: {e}")
+    return wb_xl.active, wb_xl.close
 
 def _excel_cell_label(value):
     return " ".join(str(value or "").strip().lower().split())
@@ -1566,15 +1612,13 @@ def _parse_inventory_snapshot_ws(ws, layout, sku_lookup, gudang_index):
         )
     return rows_out, warnings, excluded_unrecognized, unmapped_locations
 
-def parse_system_stock_excel(file_bytes, sku_lookup=None, gudang_index=None):
+def parse_system_stock_excel(file_bytes, sku_lookup=None, gudang_index=None, filename=None):
     """Parse ERP gudang-column export or inventory snapshot (Item/Location/On Hand)."""
-    wb_xl = load_workbook(BytesIO(file_bytes), data_only=True)
-    ws = wb_xl.active
     if not sku_lookup:
-        wb_xl.close()
         raise ValueError("Daftar SKU tidak tersedia. Periksa tab SKU List di sheet sebelum upload.")
-    layout_kind, layout = detect_excel_stock_layout(ws)
+    ws, close_ws = open_stock_excel_worksheet(file_bytes, filename=filename)
     try:
+        layout_kind, layout = detect_excel_stock_layout(ws)
         if layout_kind == "snapshot":
             if not gudang_index:
                 raise ValueError(
@@ -1587,7 +1631,7 @@ def parse_system_stock_excel(file_bytes, sku_lookup=None, gudang_index=None):
         rows, warnings, excluded, unmapped_file = _parse_erp_gudang_stock_ws(ws, layout, sku_lookup)
         return rows, warnings, excluded, unmapped_file, "erp"
     finally:
-        wb_xl.close()
+        close_ws()
 
 def stock_variance_pct(system_qty, running_qty):
     gap = running_qty - system_qty
@@ -1712,14 +1756,14 @@ def refresh_session_stock_tab(session_id):
         "physical_only_rows": physical_only,
     }
 
-def import_system_stock_for_session(session_id, file_bytes):
+def import_system_stock_for_session(session_id, file_bytes, filename=None):
     if not require_valid_session_id(session_id):
         raise ValueError("Sesi tidak valid.")
     wb = get_spreadsheet_cached()
     sku_lookup = load_sku_lookup_cached(wb)
     gudang_index, _ = build_gudang_location_index(wb)
     stock_rows, warnings, excluded_unrecognized, unmapped_file, upload_format = parse_system_stock_excel(
-        file_bytes, sku_lookup=sku_lookup, gudang_index=gudang_index
+        file_bytes, sku_lookup=sku_lookup, gudang_index=gudang_index, filename=filename
     )
     sheet = wb.worksheet("Raw Counts")
     records = read_raw_counts_for_summary(sheet, session_id=session_id)
@@ -4273,7 +4317,7 @@ ADMIN_STOCK_HTML_TEMPLATE = """
         <section class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
             <h2 class="text-base font-bold text-zinc-900">Upload stok sistem (Excel)</h2>
             <p class="text-sm text-zinc-600">
-                Dua format dideteksi otomatis dari file Excel:
+                Dua format dideteksi otomatis dari file Excel (<strong>.xlsx</strong> atau <strong>.xls</strong>):
             </p>
             <ul class="text-sm text-zinc-600 list-disc pl-5 space-y-1">
                 <li>
@@ -4300,8 +4344,8 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                     </select>
                 </div>
                 <div>
-                    <label for="excelFile" class="block text-sm font-semibold text-zinc-700 mb-2">File Excel (.xlsx)</label>
-                    <input id="excelFile" type="file" accept=".xlsx,.xlsm"
+                    <label for="excelFile" class="block text-sm font-semibold text-zinc-700 mb-2">File Excel (.xlsx atau .xls)</label>
+                    <input id="excelFile" type="file" accept=".xlsx,.xlsm,.xls"
                         class="w-full border border-zinc-200 rounded-lg px-3 py-2 text-sm file:mr-3 file:py-1 file:px-3 file:rounded-md file:border-0 file:bg-violet-50 file:text-violet-700 file:font-semibold">
                 </div>
             </div>
@@ -4557,7 +4601,7 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                 return;
             }
             if (!fileInput.files || !fileInput.files[0]) {
-                setStatus('uploadStatus', 'Pilih file Excel (.xlsx).', 'error');
+                setStatus('uploadStatus', 'Pilih file Excel (.xlsx atau .xls).', 'error');
                 return;
             }
             btn.disabled = true;
@@ -4983,9 +5027,9 @@ def api_admin_stock_upload():
         upload = request.files.get("file")
         if not upload or not upload.filename:
             return jsonify({"status": "error", "message": "File Excel wajib diunggah."}), 400
-        if not upload.filename.lower().endswith((".xlsx", ".xlsm")):
-            return jsonify({"status": "error", "message": "Format file harus .xlsx atau .xlsm."}), 400
-        result = import_system_stock_for_session(session_id, upload.read())
+        if not is_stock_upload_filename(upload.filename):
+            return jsonify({"status": "error", "message": "Format file harus .xlsx, .xlsm, atau .xls."}), 400
+        result = import_system_stock_for_session(session_id, upload.read(), filename=upload.filename)
         return jsonify({"status": "success", **result}), 200
     except ValueError as e:
         return jsonify({"status": "error", "message": str(e)}), 400
