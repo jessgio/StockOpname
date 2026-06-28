@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import xml.etree.ElementTree as ET
 from io import BytesIO
 from threading import Lock
 from flask import Flask, render_template_string, request, jsonify
@@ -1298,14 +1299,94 @@ class _XlrdWorksheetAdapter:
             return _ExcelCell(None)
         return _ExcelCell(self._sheet.cell_value(r, c))
 
+class _SpreadsheetXmlWorksheetAdapter:
+    """openpyxl-like view of Excel SpreadsheetML (NetSuite .xls XML export)."""
+
+    def __init__(self, grid):
+        self._grid = grid
+        self.max_row = len(grid)
+        self.max_column = max((len(row) for row in grid), default=0)
+
+    def cell(self, row, column):
+        r, c = row - 1, column - 1
+        if r < 0 or r >= len(self._grid):
+            return _ExcelCell(None)
+        row_data = self._grid[r]
+        if c < 0 or c >= len(row_data):
+            return _ExcelCell(None)
+        return _ExcelCell(row_data[c])
+
 def is_stock_upload_filename(filename):
     return bool(filename) and str(filename).lower().endswith(STOCK_UPLOAD_EXTENSIONS)
+
+def is_spreadsheet_xml_bytes(file_bytes):
+    """NetSuite and similar tools often export SpreadsheetML with a .xls extension."""
+    if not file_bytes:
+        return False
+    head = file_bytes[:8192].lstrip()
+    if not (head.startswith(b"<?xml") or head.startswith(b"<Workbook")):
+        return False
+    snippet = head.decode("utf-8", errors="ignore")
+    return "schemas-microsoft-com:office:spreadsheet" in snippet
+
+def _spreadsheet_xml_attr_value(element, suffix):
+    for key, value in element.attrib.items():
+        if key == suffix or key.endswith(f"}}{suffix}"):
+            return value
+    return None
+
+def _spreadsheet_xml_cell_value(data_el):
+    if data_el is None:
+        return None
+    text = data_el.text
+    if text is None:
+        return None
+    data_type = _spreadsheet_xml_attr_value(data_el, "Type")
+    if data_type == "Number":
+        try:
+            return float(text)
+        except (ValueError, TypeError):
+            return text
+    return text
+
+def parse_spreadsheet_xml_grid(file_bytes):
+    try:
+        text = file_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        text = file_bytes.decode("utf-8", errors="replace")
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        raise ValueError(f"Tidak dapat membaca file Spreadsheet XML: {e}")
+    grid = []
+    for row_el in root.iter():
+        if not row_el.tag.endswith("Row"):
+            continue
+        cells = [child for child in row_el if child.tag.endswith("Cell")]
+        if not cells:
+            grid.append([])
+            continue
+        row_vals = {}
+        next_col = 1
+        for cell_el in cells:
+            index = _spreadsheet_xml_attr_value(cell_el, "Index")
+            col = int(index) if index else next_col
+            next_col = col + 1
+            data_el = next((child for child in cell_el if child.tag.endswith("Data")), None)
+            row_vals[col] = _spreadsheet_xml_cell_value(data_el)
+        max_col = max(row_vals.keys()) if row_vals else 0
+        grid.append([row_vals.get(col) for col in range(1, max_col + 1)])
+    if not grid:
+        raise ValueError("File Spreadsheet XML tidak berisi baris data.")
+    return grid
 
 def is_xls_workbook_bytes(file_bytes):
     return len(file_bytes) >= 8 and file_bytes[:8] == _XLS_OLE_MAGIC
 
 def open_stock_excel_worksheet(file_bytes, filename=None):
-    """Open first worksheet from .xls (xlrd) or .xlsx/.xlsm (openpyxl). Returns (ws, close_fn)."""
+    """Open worksheet from SpreadsheetML .xls, binary .xls, or .xlsx/.xlsm. Returns (ws, close_fn)."""
+    if is_spreadsheet_xml_bytes(file_bytes):
+        return _SpreadsheetXmlWorksheetAdapter(parse_spreadsheet_xml_grid(file_bytes)), lambda: None
     use_xls = is_xls_workbook_bytes(file_bytes)
     if not use_xls and filename and str(filename).lower().endswith(".xls"):
         use_xls = True
@@ -1313,7 +1394,10 @@ def open_stock_excel_worksheet(file_bytes, filename=None):
         try:
             book = xlrd.open_workbook(file_contents=file_bytes)
         except Exception as e:
-            raise ValueError(f"Tidak dapat membaca file .xls: {e}")
+            raise ValueError(
+                f"Tidak dapat membaca file .xls: {e}. "
+                "Jika file dari NetSuite, pastikan format ekspor Spreadsheet XML (.xls) didukung."
+            )
         return _XlrdWorksheetAdapter(book.sheet_by_index(0)), lambda: None
     try:
         wb_xl = load_workbook(BytesIO(file_bytes), data_only=True)
@@ -4323,7 +4407,8 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                 <li>
                     <strong>Inventory snapshot</strong> (NetSuite): header di baris 6 (atau baris lain dalam 25 baris pertama)
                     dengan kolom <strong>Item</strong> (SKU), <strong>Location</strong> (lokasi virtual sistem),
-                    dan <strong>On Hand</strong> (kuantitas sistem). Lokasi di file dipetakan ke gudang via tab
+                    dan <strong>On Hand</strong> (kuantitas sistem). Ekspor NetSuite Spreadsheet XML (.xls) didukung.
+                    Lokasi di file dipetakan ke gudang via tab
                     <strong>GUDANG LOCATIONS</strong>; baris dengan SKU/lokasi sama dijumlahkan per gudang.
                 </li>
                 <li>
