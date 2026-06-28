@@ -910,6 +910,7 @@ def build_assignments_payload(wb, counter_lookup, location_lookup):
     global_by_counter = {}
     enforced_session_ids = set()
     warnings = []
+    seen_warnings = set()
     for item in rows:
         session_id = item["session_id"]
         raw_counter = item["counter"]
@@ -918,15 +919,17 @@ def build_assignments_payload(wb, counter_lookup, location_lookup):
         location = resolve_location(raw_location, location_lookup)
         if raw_counter and counter_lookup and not counter:
             label = session_id or "global"
-            warnings.append(
-                f"PETUGAS ASSIGNMENTS: petugas tidak di COUNTERS — {raw_counter!r} (sesi {label})"
-            )
+            msg = f"PETUGAS ASSIGNMENTS: petugas tidak di COUNTERS — {raw_counter!r} (sesi {label})"
+            if msg not in seen_warnings:
+                seen_warnings.add(msg)
+                warnings.append(msg)
             continue
         if raw_location and location_lookup and not location:
             label = session_id or "global"
-            warnings.append(
-                f"PETUGAS ASSIGNMENTS: lokasi tidak di LOCATIONS — {raw_location!r} (sesi {label})"
-            )
+            msg = f"PETUGAS ASSIGNMENTS: lokasi tidak di LOCATIONS — {raw_location!r} (sesi {label})"
+            if msg not in seen_warnings:
+                seen_warnings.add(msg)
+                warnings.append(msg)
             continue
         if not counter or not location:
             continue
@@ -1946,7 +1949,10 @@ HTML_TEMPLATE = """
                             <a href="/summary" class="text-zinc-500 hover:text-violet-700">Summary</a>
                         </div>
                         <p id="sessionBadge" class="text-[10px] text-zinc-500 max-w-[10rem] truncate"></p>
-                        <button type="button" onclick="endSession()" class="text-[10px] text-rose-600 hover:text-rose-800 font-semibold">End Session</button>
+                        <div class="flex flex-wrap gap-2 justify-end">
+                            <button type="button" onclick="refreshLookupsFromSheet()" class="text-[10px] text-violet-700 hover:text-violet-900 font-semibold">Refresh daftar</button>
+                            <button type="button" onclick="endSession()" class="text-[10px] text-rose-600 hover:text-rose-800 font-semibold">End Session</button>
+                        </div>
                     </nav>
                 </div>
             </div>
@@ -2492,13 +2498,30 @@ HTML_TEMPLATE = """
             return true;
         }
 
-        async function loadLookups() {
+        async function loadLookups(forceRefresh = false) {
             try {
-                const res = await fetch('/api/lookups');
+                const qs = forceRefresh ? '?refresh=1' : '';
+                const res = await fetch('/api/lookups' + qs);
                 if (res.ok) {
                     applyLookupData(await res.json());
                 }
             } catch (e) {}
+        }
+
+        async function refreshLookupsFromSheet() {
+            skuIndexLoaded = false;
+            await loadLookups(true);
+            try {
+                const res = await fetch('/api/sku-codes?refresh=1');
+                if (res.ok) {
+                    const data = await res.json();
+                    skuLookup = data.sku_lookup || {};
+                    skuCodes = data.sku_codes || [];
+                    skuIndexLoaded = true;
+                }
+            } catch (e) {}
+            showToast('Daftar petugas & lokasi dimuat ulang dari sheet.', 'success');
+            await syncUIState({ refreshHistory: false });
         }
 
         function resetScanDebounce() {
@@ -4079,8 +4102,12 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                     class="px-4 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-sm font-semibold">
                     Simpan token
                 </button>
+                <button type="button" onclick="verifyAdminToken()"
+                    class="px-4 py-2.5 rounded-lg border border-violet-300 text-violet-800 text-sm font-semibold hover:bg-violet-50">
+                    Uji token
+                </button>
             </div>
-            <p id="adminTokenStatus" class="hidden text-sm text-zinc-600"></p>
+            <div id="adminTokenStatus" class="hidden rounded-lg border px-3 py-2 text-sm"></div>
         </section>
         <section class="bg-white rounded-xl border border-zinc-200 shadow-sm p-5 space-y-4">
             <h2 class="text-base font-bold text-zinc-900">Upload stok sistem (Excel)</h2>
@@ -4199,15 +4226,63 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             return headers;
         }
 
+        function showAdminTokenStatus(message, kind) {
+            const status = document.getElementById('adminTokenStatus');
+            if (!status) return;
+            status.textContent = message;
+            status.classList.remove('hidden', 'border-emerald-200', 'bg-emerald-50', 'text-emerald-900',
+                'border-rose-200', 'bg-rose-50', 'text-rose-900', 'border-zinc-200', 'bg-zinc-50', 'text-zinc-700');
+            if (kind === 'success') {
+                status.classList.add('border-emerald-200', 'bg-emerald-50', 'text-emerald-900');
+            } else if (kind === 'error') {
+                status.classList.add('border-rose-200', 'bg-rose-50', 'text-rose-900');
+            } else {
+                status.classList.add('border-zinc-200', 'bg-zinc-50', 'text-zinc-700');
+            }
+            status.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+
         function saveAdminToken() {
             const input = document.getElementById('adminTokenInput');
-            const status = document.getElementById('adminTokenStatus');
             const token = (input.value || '').trim();
             if (token) sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
             else sessionStorage.removeItem(ADMIN_TOKEN_KEY);
-            status.textContent = token ? 'Token disimpan untuk sesi browser ini.' : 'Token dihapus.';
-            status.classList.remove('hidden', 'text-rose-600');
-            status.classList.add('text-emerald-700');
+            showAdminTokenStatus(
+                token
+                    ? 'Token disimpan di browser ini. Klik "Uji token" untuk memastikan cocok dengan Vercel.'
+                    : 'Token dihapus dari browser ini.',
+                token ? 'success' : 'info'
+            );
+        }
+
+        async function verifyAdminToken() {
+            const token = getAdminToken();
+            if (!token) {
+                showAdminTokenStatus('Belum ada token. Ketik token Vercel lalu klik Simpan token.', 'error');
+                return;
+            }
+            showAdminTokenStatus('Memeriksa token…', 'info');
+            try {
+                const res = await fetch('/api/admin/gudang-locations?refresh=1', { headers: adminAuthHeaders() });
+                const data = await res.json().catch(() => ({}));
+                if (res.status === 401) {
+                    showAdminTokenStatus(
+                        'Token ditolak (401 Unauthorized). Periksa ADMIN_TOKEN di Vercel dan paste ulang di sini.',
+                        'error'
+                    );
+                    return;
+                }
+                if (!res.ok) {
+                    showAdminTokenStatus(data.message || data.error || 'Gagal memverifikasi token.', 'error');
+                    return;
+                }
+                showAdminTokenStatus(
+                    'Token valid — admin API merespons OK. Anda bisa upload stok dan simpan penugasan.',
+                    'success'
+                );
+            } catch (e) {
+                showAdminTokenStatus('Kesalahan jaringan saat uji token. Coba lagi.', 'error');
+            }
         }
 
         (function initAdminTokenField() {
