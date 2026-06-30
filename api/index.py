@@ -1265,6 +1265,7 @@ def aggregate_counts_by_sku(records):
 
 GUDANG_LOCATION_TAB_NAMES = ("GUDANG LOCATIONS", "Gudang Locations", "Location Gudang")
 STOCK_RECON_HEADERS = ("Gudang", "SKU", "System Qty", "Running Count", "Gap", "Variance %")
+SESSION_STOCK_ACCURATE_SUFFIX = "-ACCURATE"
 _EXCEL_GUDANG_ROW = 5
 _EXCEL_SKU_COL = 3
 _EXCEL_DATA_START_ROW = 6
@@ -1276,6 +1277,8 @@ _INVENTORY_LOCATION_HEADERS = frozenset({
 _INVENTORY_ON_HAND_HEADERS = frozenset({
     "on hand", "onhand", "on-hand", "qty on hand", "quantity on hand", "on hand qty",
 })
+_ACCURATE_QTY_HEADERS = frozenset({"kuantitas", "quantity", "qty", "jumlah", "qty."})
+_ACCURATE_GUDANG_HEADERS = frozenset({"gudang", "warehouse", "nama gudang"})
 STOCK_UPLOAD_EXTENSIONS = (".xlsx", ".xlsm", ".xls")
 _XLS_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
@@ -1430,6 +1433,31 @@ def find_inventory_snapshot_header_row(ws):
             return header_row, item_col, loc_col, qty_col
     return None
 
+def find_accurate_stock_header_row(ws):
+    """Find Accurate ERP row layout: Kode Barang + Kuantitas + Gudang in one header row."""
+    max_scan_row = min(5, ws.max_row or 1)
+    max_col = max(ws.max_column or 0, 8)
+    for header_row in range(1, max_scan_row + 1):
+        item_col = None
+        gudang_col = None
+        qty_col = None
+        gudang_column_headers = 0
+        for col in range(1, max_col + 1):
+            low = _excel_cell_label(ws.cell(row=header_row, column=col).value)
+            if not low:
+                continue
+            if item_col is None and (_is_excel_sku_header(low) or low in _INVENTORY_ITEM_HEADERS):
+                item_col = col
+            if qty_col is None and low in _ACCURATE_QTY_HEADERS:
+                qty_col = col
+            if low in _ACCURATE_GUDANG_HEADERS:
+                gudang_col = col
+            elif _is_gudang_stock_column(normalize_gudang_label(ws.cell(row=header_row, column=col).value)):
+                gudang_column_headers += 1
+        if item_col and qty_col and gudang_col and gudang_column_headers == 0:
+            return header_row, item_col, gudang_col, qty_col
+    return None
+
 def _is_excel_sku_header(label):
     low = " ".join(str(label or "").strip().lower().split())
     if not low:
@@ -1460,10 +1488,13 @@ def detect_erp_gudang_layout(ws):
     return header_row, sku_col, gudang_cols
 
 def detect_excel_stock_layout(ws):
-    """Detect inventory snapshot (Item/Location/On Hand) or legacy ERP gudang-column layout."""
+    """Detect inventory snapshot, Accurate ERP rows, or legacy ERP gudang-column layout."""
     snapshot = find_inventory_snapshot_header_row(ws)
     if snapshot:
         return ("snapshot", snapshot)
+    accurate = find_accurate_stock_header_row(ws)
+    if accurate:
+        return ("accurate", accurate)
     header_row, sku_col, gudang_cols = detect_erp_gudang_layout(ws)
     return ("erp", (header_row, sku_col, gudang_cols))
 
@@ -1472,6 +1503,20 @@ def sanitize_worksheet_title(name):
     for ch in (":", "\\", "/", "?", "*", "[", "]"):
         s = s.replace(ch, "-")
     return (s[:100] if s else "Session")
+
+def session_stock_tab_title(session_id, tab_suffix=""):
+    """Worksheet title for session stock reconcile tab (optional suffix, e.g. -ACCURATE)."""
+    base = sanitize_worksheet_title(session_id)
+    suffix = str(tab_suffix or "")
+    if not suffix:
+        return base
+    max_base = max(1, 100 - len(suffix))
+    return base[:max_base] + suffix
+
+def session_stock_tab_suffix_for_format(upload_format):
+    if upload_format == "accurate":
+        return SESSION_STOCK_ACCURATE_SUFFIX
+    return ""
 
 def parse_excel_quantity(value):
     if value is None or value == "":
@@ -1656,6 +1701,50 @@ def _parse_erp_gudang_stock_ws(ws, layout, sku_lookup):
         )
     return rows_out, warnings, excluded_unrecognized, set()
 
+def _parse_accurate_stock_ws(ws, layout, sku_lookup):
+    """Parse Accurate ERP rows: Kode Barang, Kuantitas, Gudang per data row."""
+    header_row, item_col, gudang_col, qty_col = layout
+    totals = {}
+    warnings = []
+    excluded_unrecognized = 0
+    data_start = header_row + 1
+    max_row = ws.max_row or data_start
+    for row_idx in range(data_start, max_row + 1):
+        raw_sku = ws.cell(row=row_idx, column=item_col).value
+        if raw_sku is None or str(raw_sku).strip() == "":
+            continue
+        sku = str(raw_sku).strip()
+        if _is_excel_summary_sku_row(sku):
+            continue
+        raw_gudang = ws.cell(row=row_idx, column=gudang_col).value
+        gudang = normalize_gudang_label(raw_gudang)
+        if not gudang:
+            continue
+        resolved = resolve_sku(sku, sku_lookup)
+        if not resolved:
+            excluded_unrecognized += 1
+            if len(warnings) < 50:
+                warnings.append(f"SKU tidak dikenali (baris {row_idx}): {sku}")
+            continue
+        qty = parse_excel_quantity(ws.cell(row=row_idx, column=qty_col).value)
+        if qty == 0:
+            continue
+        key = session_stock_key(gudang, resolved)
+        if not key[0] or not key[1]:
+            continue
+        totals[key] = totals.get(key, 0) + qty
+    rows_out = [
+        {"gudang": gudang, "sku": sku, "system_qty": qty}
+        for (gudang, sku), qty in sorted(totals.items())
+    ]
+    if not rows_out:
+        raise ValueError(
+            "Tidak ada baris stok sistem yang terbaca dari ekspor Accurate. "
+            "Pastikan baris 1 berisi header Kode Barang, Kuantitas, dan Gudang; "
+            "SKU ada di tab SKU List; dan kuantitas tidak nol."
+        )
+    return rows_out, warnings, excluded_unrecognized, set()
+
 def _parse_inventory_snapshot_ws(ws, layout, sku_lookup, gudang_index):
     """Parse Item / Location / On Hand rows; map Location via GUDANG LOCATIONS → gudang."""
     header_row, item_col, loc_col, qty_col = layout
@@ -1735,7 +1824,7 @@ def _parse_inventory_snapshot_ws(ws, layout, sku_lookup, gudang_index):
     return rows_out, warnings, excluded_unrecognized, unmapped_locations
 
 def parse_system_stock_excel(file_bytes, sku_lookup=None, gudang_index=None, filename=None):
-    """Parse ERP gudang-column export or inventory snapshot (Item/Location/On Hand)."""
+    """Parse inventory snapshot, Accurate ERP rows, or ERP gudang-column export."""
     if not sku_lookup:
         raise ValueError("Daftar SKU tidak tersedia. Periksa tab SKU List di sheet sebelum upload.")
     ws, close_ws = open_stock_excel_worksheet(file_bytes, filename=filename)
@@ -1750,6 +1839,11 @@ def parse_system_stock_excel(file_bytes, sku_lookup=None, gudang_index=None, fil
                 ws, layout, sku_lookup, gudang_index
             )
             return rows, warnings, excluded, unmapped_file, "snapshot"
+        if layout_kind == "accurate":
+            rows, warnings, excluded, unmapped_file = _parse_accurate_stock_ws(
+                ws, layout, sku_lookup
+            )
+            return rows, warnings, excluded, unmapped_file, "accurate"
         rows, warnings, excluded, unmapped_file = _parse_erp_gudang_stock_ws(ws, layout, sku_lookup)
         return rows, warnings, excluded, unmapped_file, "erp"
     finally:
@@ -1815,8 +1909,8 @@ def build_session_stock_body(stock_rows, running_by_key):
 
     return body, physical_only
 
-def get_session_stock_worksheet(wb, session_id, create=False):
-    title = sanitize_worksheet_title(session_id)
+def get_session_stock_worksheet(wb, session_id, create=False, tab_suffix=""):
+    title = session_stock_tab_title(session_id, tab_suffix)
     try:
         return wb.worksheet(title)
     except Exception:
@@ -1826,8 +1920,8 @@ def get_session_stock_worksheet(wb, session_id, create=False):
     ws.append_row(list(STOCK_RECON_HEADERS))
     return ws
 
-def session_stock_tab_exists(wb, session_id):
-    return get_session_stock_worksheet(wb, session_id, create=False) is not None
+def session_stock_tab_exists(wb, session_id, tab_suffix=""):
+    return get_session_stock_worksheet(wb, session_id, create=False, tab_suffix=tab_suffix) is not None
 
 def write_session_stock_tab(ws, stock_rows, running_by_key):
     """Rewrite session tab with ERP rows plus physical-only (gudang, sku) append rows."""
@@ -1853,10 +1947,10 @@ def stock_rows_from_session_tab_data(data):
         })
     return stock_rows
 
-def refresh_session_stock_tab(session_id):
+def refresh_session_stock_tab(session_id, tab_suffix=""):
     """Recalculate session tab from stored system qty plus latest physical counts."""
     wb = get_spreadsheet_cached()
-    ws = get_session_stock_worksheet(wb, session_id, create=False)
+    ws = get_session_stock_worksheet(wb, session_id, create=False, tab_suffix=tab_suffix)
     if not ws:
         return {"updated": 0, "skipped": True}
     try:
@@ -1887,17 +1981,18 @@ def import_system_stock_for_session(session_id, file_bytes, filename=None):
     stock_rows, warnings, excluded_unrecognized, unmapped_file, upload_format = parse_system_stock_excel(
         file_bytes, sku_lookup=sku_lookup, gudang_index=gudang_index, filename=filename
     )
+    tab_suffix = session_stock_tab_suffix_for_format(upload_format)
     sheet = wb.worksheet("Raw Counts")
     records = read_raw_counts_for_summary(sheet, session_id=session_id)
     running_by_key, unmapped_physical = aggregate_counts_by_gudang_sku(records, gudang_index)
-    ws = get_session_stock_worksheet(wb, session_id, create=True)
+    ws = get_session_stock_worksheet(wb, session_id, create=True, tab_suffix=tab_suffix)
     row_count, physical_only = write_session_stock_tab(ws, stock_rows, running_by_key)
     _STOCK_REFRESH_LAST[session_id] = time.time()
     all_unmapped = sorted(set(unmapped_physical) | set(unmapped_file))
     return {
         "row_count": row_count,
         "physical_only_rows": physical_only,
-        "tab_title": sanitize_worksheet_title(session_id),
+        "tab_title": session_stock_tab_title(session_id, tab_suffix),
         "warnings": warnings,
         "excluded_unrecognized": excluded_unrecognized,
         "unmapped_locations": all_unmapped,
@@ -1946,8 +2041,12 @@ def maybe_refresh_session_stock(session_id, force=False):
             return
     try:
         wb = get_spreadsheet_cached()
-        if session_stock_tab_exists(wb, session_id):
-            refresh_session_stock_tab(session_id)
+        refreshed = False
+        for suffix in ("", SESSION_STOCK_ACCURATE_SUFFIX):
+            if session_stock_tab_exists(wb, session_id, tab_suffix=suffix):
+                refresh_session_stock_tab(session_id, tab_suffix=suffix)
+                refreshed = True
+        if refreshed:
             _STOCK_REFRESH_LAST[session_id] = now
     except Exception:
         pass
@@ -4445,7 +4544,7 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                 </button>
             </div>
             <p class="text-sm text-zinc-600">
-                Dua format dideteksi otomatis dari file Excel (<strong>.xlsx</strong> atau <strong>.xls</strong>):
+                Tiga format dideteksi otomatis dari file Excel (<strong>.xlsx</strong> atau <strong>.xls</strong>):
             </p>
             <ul class="text-sm text-zinc-600 list-disc pl-5 space-y-1">
                 <li>
@@ -4456,6 +4555,11 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                     <strong>GUDANG LOCATIONS</strong>; baris dengan SKU/lokasi sama dijumlahkan per gudang.
                 </li>
                 <li>
+                    <strong>Accurate</strong>: header di baris <strong>1</strong> dengan kolom
+                    <strong>Kode Barang</strong> (SKU), <strong>Kuantitas</strong>, dan <strong>Gudang</strong>
+                    (nama gudang per baris). Baris dengan SKU/gudang sama dijumlahkan.
+                </li>
+                <li>
                     <strong>ERP gudang kolom</strong>: baris <strong>5</strong> berisi <strong>Kode Barang</strong> dan nama gudang;
                     data mulai baris 6 (kolom SKU terdeteksi otomatis, biasanya kolom A atau C).
                 </li>
@@ -4463,7 +4567,8 @@ ADMIN_STOCK_HTML_TEMPLATE = """
             <p class="text-sm text-zinc-600">
                 Hanya SKU yang ada di tab <strong>SKU List</strong> yang dimasukkan; baris seperti <strong>Total Kode Barang</strong> diabaikan.
                 Setelah menambah SKU atau mapping gudang di Google Sheet, klik <strong>Refresh daftar</strong> lalu upload ulang file.
-                Tab baru di Google Sheet dibuat dengan nama <strong>Session ID</strong>.
+                Tab reconcile di Google Sheet: <strong>Session ID</strong> (NetSuite / ERP kolom) atau
+                <strong>Session ID-ACCURATE</strong> (ekspor Accurate).
                 Hitungan fisik (Raw Counts) untuk pasangan gudang/SKU yang tidak ada di file ditambahkan dengan <strong>System Qty 0</strong>.
             </p>
             <p id="lookupRefreshStatus" class="hidden text-sm"></p>
@@ -4787,6 +4892,8 @@ ADMIN_STOCK_HTML_TEMPLATE = """
                 let msg = 'Tab "' + (data.tab_title || sessionId) + '" dibuat/diperbarui dengan ' + data.row_count + ' baris.';
                 if (data.upload_format === 'snapshot') {
                     msg += ' Format: inventory snapshot (Item / Location / On Hand).';
+                } else if (data.upload_format === 'accurate') {
+                    msg += ' Format: Accurate (Kode Barang / Kuantitas / Gudang).';
                 } else if (data.upload_format === 'erp') {
                     msg += ' Format: ERP gudang kolom.';
                 }
